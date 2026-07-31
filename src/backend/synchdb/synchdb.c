@@ -108,6 +108,7 @@ int dbz_query_timeout_ms = 600000;
 int jvm_max_heap_size = 1024;
 int jvm_max_direct_buffer_size = 1024;
 int dbz_snapshot_thread_num = 2;
+char * dbz_time_precision_mode = "adaptive_time_microseconds";
 int dbz_snapshot_fetch_size = 0; /* 0: auto */
 int dbz_snapshot_min_row_to_stream_results = 0; /* 0: always stream */
 int dbz_incremental_snapshot_chunk_size = 2048;
@@ -275,12 +276,12 @@ static void set_extra_dbz_parameters(jobject myParametersObj, jclass myParameter
 		const OLRConnectionInfo * olrConnInfo, const IspnInfo * ispnInfo)
 {
 	jmethodID setBatchSize, setQueueSize, setSkippedOperations, setConnectTimeout, setQueryTimeout;
-	jmethodID setSnapshotThreadNum, setSnapshotFetchSize, setSnapshotMinRowToStreamResults;
+	jmethodID setSnapshotThreadNum, setTimePrecisionMode, setSnapshotFetchSize, setSnapshotMinRowToStreamResults;
 	jmethodID setIncrementalSnapshotChunkSize, setIncrementalSnapshotWatermarkingStrategy;
 	jmethodID setOffsetFlushIntervalMs, setCaptureOnlySelectedTableDDL;
 	jmethodID setSslmode, setSslKeystore, setSslKeystorePass, setSslTruststore, setSslTruststorePass;
 	jmethodID setLogLevel, setOlr, setIspn, setLogminerStreamMode, setCdcDelay;
-	jstring jdbz_skipped_operations, jdbz_watermarking_strategy;
+	jstring jdbz_skipped_operations, jdbz_time_precision_mode, jdbz_watermarking_strategy;
 	jstring jdbz_sslmode, jdbz_sslkeystore, jdbz_sslkeystorepass, jdbz_ssltruststore, jdbz_ssltruststorepass;
 	jstring jolrHost, jolrSource;
 	jstring jispnMemoryType, jispnCacheType;
@@ -368,6 +369,24 @@ static void set_extra_dbz_parameters(jobject myParametersObj, jclass myParameter
 	}
 	else
 		elog(WARNING, "failed to find setSnapshotThreadNum method");
+
+	jdbz_time_precision_mode = (*env)->NewStringUTF(env, dbz_time_precision_mode);
+
+	setTimePrecisionMode = (*env)->GetMethodID(env, myParametersClass, "setTimePrecisionMode",
+			"(Ljava/lang/String;)Lcom/example/DebeziumRunner$MyParameters;");
+	if (setTimePrecisionMode)
+	{
+		myParametersObj = (*env)->CallObjectMethod(env, myParametersObj, setTimePrecisionMode, jdbz_time_precision_mode);
+		if (!myParametersObj)
+		{
+			elog(WARNING, "failed to call setTimePrecisionMode method");
+		}
+	}
+	else
+		elog(WARNING, "failed to find setTimePrecisionMode method");
+
+	if (jdbz_time_precision_mode)
+			(*env)->DeleteLocalRef(env, jdbz_time_precision_mode);
 
 	setSnapshotFetchSize = (*env)->GetMethodID(env, myParametersClass, "setSnapshotFetchSize",
 			"(I)Lcom/example/DebeziumRunner$MyParameters;");
@@ -4285,6 +4304,15 @@ _PG_init(void)
 							PGC_SIGHUP,
 							0,
 							NULL, NULL, NULL);
+
+	DefineCustomStringVariable("synchdb.dbz_time_precision_mode",
+							   "Specifies the type of precision that the Debezium connector uses to represent time, date, and timestamps values.",
+							   NULL,
+							   &dbz_time_precision_mode,
+							   "adaptive_time_microseconds",
+							   PGC_SIGHUP,
+							   0,
+							   NULL, NULL, NULL);
 
 	DefineCustomIntVariable("synchdb.dbz_snapshot_fetch_size",
 							"number of rows Debezium fetches at a time during a snapshot",

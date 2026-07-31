@@ -89,6 +89,7 @@ public class DebeziumRunner {
 		private int connectTimeout;
 		private int queryTimeout;
 		private int snapshotThreadNum;
+		private String timePrecisionMode;
 		private int snapshotFetchSize;
 		private int snapshotMinRowToStreamResults;
 		private int incrementalSnapshotChunkSize;
@@ -157,6 +158,11 @@ public class DebeziumRunner {
 		public MyParameters setSnapshotThreadNum(int snapshotThreadNum)
 		{
 			this.snapshotThreadNum = snapshotThreadNum;
+			return this;
+		}
+		public MyParameters setTimePrecisionMode(String timePrecisionMode)
+		{
+			this.timePrecisionMode = timePrecisionMode;
 			return this;
 		}
 		public MyParameters setSnapshotFetchSize(int snapshotFetchSize)
@@ -264,6 +270,7 @@ public class DebeziumRunner {
 			logger.warn("connectTimeout = " + this.connectTimeout);
 			logger.warn("queryTimeout = " + this.queryTimeout);
 			logger.warn("snapshotThreadNum = " + this.snapshotThreadNum);
+			logger.warn("timePrecisionMode = " + this.timePrecisionMode);
 			logger.warn("snapshotFetchSize = " + this.snapshotFetchSize);
 			logger.warn("snapshotMinRowToStreamResults= " + this.snapshotMinRowToStreamResults);
 			logger.warn("incrementalSnapshotChunkSize = " + this.incrementalSnapshotChunkSize);
@@ -856,6 +863,7 @@ public class DebeziumRunner {
 		props.setProperty("connect.timeout", String.valueOf(myParameters.connectTimeout));
 		props.setProperty("database.query.timeout", String.valueOf(myParameters.queryTimeout));
 		props.setProperty("snapshot.max.threads", String.valueOf(myParameters.snapshotThreadNum));
+		props.setProperty("time.precision.mode", myParameters.timePrecisionMode);
 		props.setProperty("signal.enabled.channels", "file");
 		props.setProperty("signal.file", signalfile);
 		//props.setProperty("signal.data.collection", "synchdb.dbzsignal");	/* todo: make it configurable */
