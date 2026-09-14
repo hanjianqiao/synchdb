@@ -9,6 +9,7 @@ FDW based snapshot is supported for:
 * MySQL Connector
 * Postgres Connector
 * Oracle and Openlog Replicator Connectors
+* SQL Server Connector
 
 ## **How Synchdb Guarentees Consistency and Obtains Cut-Off Point**
 
@@ -45,6 +46,14 @@ WARNING: **BACKUP_ADMIN permission is required to obtain the "cut-point" paramet
 <**WARNING**> **FLASHBACK permission is required to obtain the "cut-point" parameters.**
 
 <**NOTE**> Oracle and Openlog Replicator connectors now support Container Database (CDB/PDB) architecture: as long as the source database is specified in the `CDB/PDB` format (e.g. `FREE/FREEPDB1`) when creating the connector, the FDW-based snapshot will automatically connect to the corresponding PDB service name.
+
+### **SQL Server Connector**
+
+* Before snapshot begins, read `sys.fn_cdc_get_max_lsn()`, which serves as the "cut-off" point for the snapshot. This requires SQL Server's Change Data Capture (CDC) to already be enabled on the source database and desired tables — the same prerequisite the Debezium-based SQL Server connector already requires, so this is not an extra setup step.
+* Migrate all desired tables' schema and data via ordinary (autocommit) `tds_fdw` foreign table reads. No table locks or special transaction/isolation level are used.
+* Once done, the CDC can resume from the cut-off `commit_lsn`, which will handle the data changes that happened during the snapshot.
+
+<**NOTE**> Unlike Oracle's Flashback query or a held-open repeatable-read transaction, `tds_fdw` does not manage a remote transaction across foreign table reads, so the SQL Server connector does not attempt to freeze the source to a single consistent instant. Any change committed on the source between reading the cut-off LSN and copying a given table's data is captured by the snapshot **and** redundantly replayed by CDC after resume — the same overlap-tolerance behavior the MySQL connector already relies on.
 
 ## **How does FDW Based Snapshot Work**
 
@@ -86,6 +95,10 @@ Foreign tables will be created to read the cut-off value from difference source 
 **Oracle and Openlog Replicator Connector**
 
 * Read current `SCN` from current_scn table
+
+**SQL Server Connector**
+
+* Read current `commit_lsn` (formatted as Debezium's Lsn string, e.g. `0000006a:00006608:0003`) from a foreign table backed by `sys.fn_cdc_get_max_lsn()`
 
 ### **4. Create a List of Desired Foreign Tables**
 

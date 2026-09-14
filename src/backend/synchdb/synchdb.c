@@ -2195,6 +2195,9 @@ populate_debezium_metadata(ConnectionInfo * connInfo, ConnectorType connectorTyp
 	else if (connectorType == TYPE_POSTGRES)
 		offsetstr = psprintf("{\"lsn\":%llu}",
 				connInfo->offsetdata.data.postgres.lsn);
+	else if (connectorType == TYPE_SQLSERVER)
+		offsetstr = psprintf("{\"commit_lsn\":\"%s\",\"snapshot\":true,\"snapshot_completed\":false}",
+				connInfo->offsetdata.data.sqlserver.commit_lsn);
 	else
 	{
 		elog(WARNING, "unsupported connector type to populate metadata");
@@ -2354,6 +2357,21 @@ dbz_read_snapshot_state(ConnectorType type, const char * offset)
 			break;
 		}
 		case TYPE_SQLSERVER:
+		{
+			/*
+			 * todo: debezium's sqlserver offset keeps a "snapshot" / "snapshot_completed"
+			 * pair around even after the connector has moved on to streaming (observed in
+			 * practice), so it cannot be used the same way as mysql/oracle's flags to tell
+			 * snapshot-done apart from snapshot-in-progress. Use presence of "commit_lsn"
+			 * instead: it is only ever written once a snapshot-to-streaming handoff has
+			 * happened at least once.
+			 */
+			if (strstr(offset, "\"commit_lsn\":"))
+			{
+				return true;
+			}
+			break;
+		}
 		case TYPE_OLR:
 		default:
 		{
@@ -2415,6 +2433,7 @@ main_loop(ConnectorType connectorType, ConnectionInfo *connInfo, char * snapshot
 					case TYPE_MYSQL:
 					case TYPE_ORACLE:
 					case TYPE_POSTGRES:
+					case TYPE_SQLSERVER:
 					{
 						if (((connInfo->flag & CONNFLAG_SCHEMA_SYNC_MODE) ||
 							(connInfo->flag & CONNFLAG_INITIAL_SNAPSHOT_MODE)) &&
@@ -2422,10 +2441,13 @@ main_loop(ConnectorType connectorType, ConnectionInfo *connInfo, char * snapshot
 						{
 							/*
 							 * Prepare to launch FDW based snapshot here and request a schema
-							 * history file to be populated for non-postgres connectors.
+							 * history file to be populated for mysql/oracle. Postgres and
+							 * sqlserver don't have a dbz-schema-history JSON builder implemented
+							 * in synchdb_create_ora_stage_fts() yet, so schema history writing
+							 * must stay disabled for them.
 							 */
 							launch_fdw_based_snapshot(connectorType, connInfo, snapshotMode,
-									connectorType == TYPE_POSTGRES ? false: true);
+									(connectorType == TYPE_POSTGRES || connectorType == TYPE_SQLSERVER) ? false: true);
 						}
 						else
 						{
@@ -2467,42 +2489,6 @@ main_loop(ConnectorType connectorType, ConnectionInfo *connInfo, char * snapshot
 						}
 						break;
 					}
-					case TYPE_SQLSERVER:
-					{
-						/* SQLSERVER does not support FDW based snapshot yet. */
-						if (connInfo->snapengine == ENGINE_FDW)
-							connInfo->snapengine = ENGINE_DEBEZIUM;
-
-						/* Debezium based snapshot, schema and CDC processing logics here */
-						myBatchInfo.batchId = SYNCHDB_INVALID_BATCH_ID;
-						myBatchInfo.batchSize = 0;
-						memset(&myBatchStats, 0, sizeof(myBatchStats));
-
-						dbz_engine_get_change(jvm, env, &cls, &obj, myConnectorId, &dbzExitSignal,
-								&myBatchInfo, &myBatchStats,
-								connInfo->flag);
-
-						/*
-						 * if a valid batchid is set by dbz_engine_get_change(), it means we have
-						 * successfully completed a batch change request and we shall notify dbz
-						 * that it's been completed.
-						 */
-						if (myBatchInfo.batchId != SYNCHDB_INVALID_BATCH_ID)
-						{
-							dbz_mark_batch_complete(myBatchInfo.batchId);
-
-							/* increment batch connector statistics */
-							increment_connector_statistics(&myBatchStats, STATS_BATCH_COMPLETION, 1);
-
-							/* update the batch statistics to shared memory */
-							set_shm_connector_statistics(myConnectorId, &myBatchStats);
-
-							/* update offset for displaying to user */
-							set_shm_dbz_offset(myConnectorId);
-						}
-						break;
-					}
-
 					case TYPE_OLR:
 					{
 #ifdef WITH_OLR
@@ -3702,13 +3688,6 @@ launch_fdw_based_snapshot(ConnectorType connectorType, ConnectionInfo *connInfo,
 	char * tbl_list = NULL;
 	char * err_offset = NULL;
 
-	/* todo: support sqlserver later */
-	if (connectorType == TYPE_SQLSERVER)
-	{
-		elog(WARNING, "FDW based snapshot is not supported on SQLSERVER");
-		return -1;
-	}
-
 	ret = ra_get_fdw_snapshot_err_table_list(connInfo->name, &tbl_list, &ntables, &err_offset);
 
 	if (ntables > 0 && tbl_list != NULL && err_offset != NULL)
@@ -3798,6 +3777,16 @@ launch_fdw_based_snapshot(ConnectorType connectorType, ConnectionInfo *connInfo,
 			}
 			elog(WARNING, "FDW based snapshot is done with LSN = %llu",
 					connInfo->offsetdata.data.postgres.lsn);
+		}
+		else if (connectorType == TYPE_SQLSERVER)
+		{
+			/* snapshot_str represents the commit_lsn, already formatted as Debezium's Lsn string */
+			connInfo->offsetdata.type = connectorType;
+			strlcpy(connInfo->offsetdata.data.sqlserver.commit_lsn, snapshot_str,
+					sizeof(connInfo->offsetdata.data.sqlserver.commit_lsn));
+
+			elog(WARNING, "FDW based snapshot is done with commit_lsn = %s",
+					connInfo->offsetdata.data.sqlserver.commit_lsn);
 		}
 		else
 		{
@@ -4609,48 +4598,40 @@ synchdb_engine_main(Datum main_arg)
 			}
 			else if (connInfo.snapengine == ENGINE_FDW)
 			{
-				/* xxx: only sqlserver dont have fdw supported as of now */
-				if (connectorType == TYPE_SQLSERVER)
+				/*
+				 * FDW based snapshot is selected, we have to check if a snapshot
+				 * has been done before and whether or not the given snapshotMode
+				 * requires us to do snapshot again
+				 */
+				const char * curroffset = get_shm_dbz_offset(myConnectorId);
+				bool isSnapshotDone = false;
+				bool snapshot = false, cdc = false;;
+
+				isSnapshotDone = dbz_read_snapshot_state(connectorType, curroffset);
+				is_snapshot_cdc_needed(snapshotMode, isSnapshotDone, &snapshot, &cdc);
+
+				elog(WARNING,"snapshot mode %s: isSnapshotDone %d, snapshot %d, cdc %d",
+						snapshotMode, isSnapshotDone, snapshot, cdc);
+
+				/* xxx set no cdc flag if requested - does it apply here?? */
+				if (!cdc)
+					connInfo.flag |= CONNFLAG_NO_CDC_MODE;
+
+				if (snapshot)
 				{
-					start_debezium_engine(connectorType, &connInfo, snapshotMode);
+					/*
+					 * indicate to main_loop that we want to do initial snapshot
+					 * via FDW by ourselves and not use debezium engine.
+					 */
+					connInfo.flag |= CONNFLAG_INITIAL_SNAPSHOT_MODE;
+
+					/* set to the right state */
+					set_shm_connector_state(myConnectorId, STATE_SYNCING);
 				}
 				else
 				{
-					/*
-					 * FDW based snapshot is selected, we have to check if a snapshot
-					 * has been done before and whether or not the given snapshotMode
-					 * requires us to do snapshot again
-					 */
-					const char * curroffset = get_shm_dbz_offset(myConnectorId);
-					bool isSnapshotDone = false;
-					bool snapshot = false, cdc = false;;
-
-					isSnapshotDone = dbz_read_snapshot_state(connectorType, curroffset);
-					is_snapshot_cdc_needed(snapshotMode, isSnapshotDone, &snapshot, &cdc);
-
-					elog(WARNING,"snapshot mode %s: isSnapshotDone %d, snapshot %d, cdc %d",
-							snapshotMode, isSnapshotDone, snapshot, cdc);
-
-					/* xxx set no cdc flag if requested - does it apply here?? */
-					if (!cdc)
-						connInfo.flag |= CONNFLAG_NO_CDC_MODE;
-
-					if (snapshot)
-					{
-						/*
-						 * indicate to main_loop that we want to do initial snapshot
-						 * via FDW by ourselves and not use debezium engine.
-						 */
-						connInfo.flag |= CONNFLAG_INITIAL_SNAPSHOT_MODE;
-
-						/* set to the right state */
-						set_shm_connector_state(myConnectorId, STATE_SYNCING);
-					}
-					else
-					{
-						/* snapshot already done, start debezium and resume CDC normally */
-						start_debezium_engine(connectorType, &connInfo, snapshotMode);
-					}
+					/* snapshot already done, start debezium and resume CDC normally */
+					start_debezium_engine(connectorType, &connInfo, snapshotMode);
 				}
 			}
 

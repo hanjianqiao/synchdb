@@ -202,8 +202,11 @@ def test_InitialSnapshotFDW(pg_cursor, dbvendor):
             assert True
             return
     elif dbvendor == "sqlserver":
-        assert True
-        return
+        isfdw = run_pg_query_one(pg_cursor, f"SELECT EXISTS ( SELECT 1 FROM pg_available_extensions WHERE name = 'tds_fdw' ) AS tds_fdw_available")
+        if isfdw[0] == False:
+            print ("test_InitialSnapshotFDW skipped - tds_fdw not available for install")
+            assert True
+            return
     elif dbvendor == "postgres":
         isfdw = run_pg_query_one(pg_cursor, f"SELECT EXISTS ( SELECT 1 FROM pg_available_extensions WHERE name = 'postgres_fdw' ) AS postgres_fdw_available")
         if isfdw[0] == False:
@@ -463,8 +466,11 @@ def test_InitialSnapshotFDW_uppercase(pg_cursor, dbvendor):
             assert True
             return
     elif dbvendor == "sqlserver":
-        assert True
-        return
+        isfdw = run_pg_query_one(pg_cursor, f"SELECT EXISTS ( SELECT 1 FROM pg_available_extensions WHERE name = 'tds_fdw' ) AS tds_fdw_available")
+        if isfdw[0] == False:
+            print ("test_InitialSnapshotFDW_uppercase skipped - tds_fdw not available for install")
+            assert True
+            return
     elif dbvendor == "postgres":
         isfdw = run_pg_query_one(pg_cursor, f"SELECT EXISTS ( SELECT 1 FROM pg_available_extensions WHERE name = 'postgres_fdw' ) AS postgres_fdw_available")
         if isfdw[0] == False:
@@ -748,8 +754,11 @@ def test_InitialSnapshotFDW_asis(pg_cursor, dbvendor):
             assert True
             return
     elif dbvendor == "sqlserver":
-        assert True
-        return
+        isfdw = run_pg_query_one(pg_cursor, f"SELECT EXISTS ( SELECT 1 FROM pg_available_extensions WHERE name = 'tds_fdw' ) AS tds_fdw_available")
+        if isfdw[0] == False:
+            print ("test_InitialSnapshotFDW_asis skipped - tds_fdw not available for install")
+            assert True
+            return
     elif dbvendor == "postgres":
         isfdw = run_pg_query_one(pg_cursor, f"SELECT EXISTS ( SELECT 1 FROM pg_available_extensions WHERE name = 'postgres_fdw' ) AS postgres_fdw_available")
         if isfdw[0] == False:
@@ -1023,8 +1032,11 @@ def test_ConnectorStartSchemaSyncModeFDW(pg_cursor, dbvendor):
             assert True
             return
     elif dbvendor == "sqlserver":
-        assert True
-        return
+        isfdw = run_pg_query_one(pg_cursor, f"SELECT EXISTS ( SELECT 1 FROM pg_available_extensions WHERE name = 'tds_fdw' ) AS tds_fdw_available")
+        if isfdw[0] == False:
+            print ("test_ConnectorStartSchemaSyncModeFDW skipped - tds_fdw not available for install")
+            assert True
+            return
     elif dbvendor == "postgres":
         isfdw = run_pg_query_one(pg_cursor, f"SELECT EXISTS ( SELECT 1 FROM pg_available_extensions WHERE name = 'postgres_fdw' ) AS postgres_fdw_available")
         if isfdw[0] == False:
@@ -1235,8 +1247,11 @@ def test_ConnectorStartAlwaysModeFDW(pg_cursor, dbvendor):
             assert True
             return
     elif dbvendor == "sqlserver":
-        assert True
-        return
+        isfdw = run_pg_query_one(pg_cursor, f"SELECT EXISTS ( SELECT 1 FROM pg_available_extensions WHERE name = 'tds_fdw' ) AS tds_fdw_available")
+        if isfdw[0] == False:
+            print ("test_ConnectorStartAlwaysModeFDW skipped - tds_fdw not available for install")
+            assert True
+            return
     elif dbvendor == "postgres":
         isfdw = run_pg_query_one(pg_cursor, f"SELECT EXISTS ( SELECT 1 FROM pg_available_extensions WHERE name = 'postgres_fdw' ) AS postgres_fdw_available")
         if isfdw[0] == False:
@@ -1417,8 +1432,11 @@ def test_ConnectorStartNodataModeFDW(pg_cursor, dbvendor):
             assert True
             return
     elif dbvendor == "sqlserver":
-        assert True
-        return
+        isfdw = run_pg_query_one(pg_cursor, f"SELECT EXISTS ( SELECT 1 FROM pg_available_extensions WHERE name = 'tds_fdw' ) AS tds_fdw_available")
+        if isfdw[0] == False:
+            print ("test_ConnectorStartNodataModeFDW skipped - tds_fdw not available for install")
+            assert True
+            return
     elif dbvendor == "postgres":
         isfdw = run_pg_query_one(pg_cursor, f"SELECT EXISTS ( SELECT 1 FROM pg_available_extensions WHERE name = 'postgres_fdw' ) AS postgres_fdw_available")
         if isfdw[0] == False:
