@@ -2516,7 +2516,7 @@ main_loop(ConnectorType connectorType, ConnectionInfo *connInfo, char * snapshot
 							 * Prepare to launch FDW based snapshot here and request a schema
 							 * history file to be populated for mysql/oracle. Postgres and
 							 * sqlserver don't have a dbz-schema-history JSON builder implemented
-							 * in synchdb_create_ora_stage_fts() yet, so schema history writing
+							 * in synchdb_create_stage_fts() yet, so schema history writing
 							 * must stay disabled for them.
 							 */
 							launch_fdw_based_snapshot(connectorType, connInfo, snapshotMode,
