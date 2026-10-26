@@ -286,8 +286,10 @@ BEGIN
 			RAISE NOTICE 'fdw_ssl_* options are ignored for tds_fdw: configure TLS via FreeTDS (freetds.conf) instead.';
 		END IF;
 
+		-- Preserve the SQL Server error number/text alongside DB-Library's
+		-- generic HV00L error (the default blackhole handler discards them).
 		EXECUTE format(
-            'CREATE SERVER %I FOREIGN DATA WRAPPER tds_fdw OPTIONS (servername %L, port %L, database %L)',
+            'CREATE SERVER %I FOREIGN DATA WRAPPER tds_fdw OPTIONS (servername %L, port %L, database %L, msg_handler ''notice'')',
             v_server, v_hostname, v_port::text, v_srcdb
         );
 

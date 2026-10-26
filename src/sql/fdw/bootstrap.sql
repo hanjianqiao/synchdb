@@ -266,6 +266,7 @@ DECLARE
     v_state text;
     v_message text;
     v_detail text;
+    v_metadata_attempt integer;
     v_count integer;
     r record;
 BEGIN
@@ -370,7 +371,29 @@ BEGIN
       WHEN 'mysql' THEN PERFORM synchdb_create_mysql_objs(v_server, v_source, '{"case":"original"}'::jsonb);
       WHEN 'sqlserver' THEN PERFORM synchdb_create_sqlserver_objs(v_server, v_source, '{"case":"original"}'::jsonb);
     END CASE;
-    PERFORM synchdb_materialize_metadata(v_source, v_meta, 'error');
+    IF v_connector = 'sqlserver' THEN
+        FOR v_metadata_attempt IN 1..3 LOOP
+            BEGIN
+                -- Roll back the entire metadata set on failure, including any
+                -- tables already copied before a later catalog read deadlocks.
+                PERFORM synchdb_materialize_metadata(v_source, v_meta, 'error');
+                EXIT;
+            EXCEPTION WHEN SQLSTATE 'HV00L' THEN
+                -- FreeTDS reports server errors as DB-Library 20018. Only
+                -- severity 13 denotes a remote transaction deadlock; do not
+                -- retry other FDW, permission, connection or query errors.
+                IF SQLERRM NOT LIKE 'DB-Library error: DB #: 20018,%, Level: 13'
+                   OR v_metadata_attempt = 3 THEN
+                    RAISE;
+                END IF;
+                RAISE NOTICE 'SQL Server metadata read deadlocked (attempt %/3); retrying',
+                    v_metadata_attempt USING DETAIL = SQLERRM;
+            END;
+            PERFORM pg_sleep(0.2 * v_metadata_attempt);
+        END LOOP;
+    ELSE
+        PERFORM synchdb_materialize_metadata(v_source, v_meta, 'error');
+    END IF;
     EXECUTE format('SELECT coalesce(jsonb_agg(jsonb_build_object(''db'',$1,''schema'',"schema",''table'',table_name)
                        ORDER BY "schema",table_name),''[]''::jsonb)
                     FROM (SELECT DISTINCT "schema",table_name FROM %I.columns WHERE "schema"=$2) inventory', v_meta)
