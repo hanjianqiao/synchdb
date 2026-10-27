@@ -1394,7 +1394,6 @@ parseOLRDML(Jsonb * jb, char op, Jsonb * payload, orascn * scn, orascn * c_scn, 
 	HASHCTL hash_ctl;
 	NameOidEntry * entry;
 	NameJsonposEntry * entry2;
-	Oid schemaoid;
 	Relation rel;
 	TupleDesc tupdesc;
 	int attnum;
@@ -1500,61 +1499,26 @@ parseOLRDML(Jsonb * jb, char op, Jsonb * payload, orascn * scn, orascn * c_scn, 
 	appendStringInfo(&objid, "%s", table);
 
 	olrdml->remoteObjectId = pstrdup(objid.data);
-	olrdml->mappedObjectId = transform_object_name(olrdml->remoteObjectId, "table");
-	if (olrdml->mappedObjectId)
-	{
-		char * objectIdCopy = pstrdup(olrdml->mappedObjectId);
-		char * db2 = NULL, * table2 = NULL, * schema2 = NULL;
-
-		splitIdString(objectIdCopy, &db2, &schema2, &table2, false);
-		if (!table2)
-		{
-			/* save the error */
-			char * msg = palloc0(SYNCHDB_ERRMSG_SIZE);
-			snprintf(msg, SYNCHDB_ERRMSG_SIZE, "transformed object ID is invalid: %s",
-					olrdml->mappedObjectId);
-			set_shm_connector_errmsg(myConnectorId, msg);
-
-			/* trigger pg's error shutdown routine */
-			elog(ERROR, "%s", msg);
-		}
-		else
-			olrdml->table = pstrdup(table2);
-
-		if (schema2)
-			olrdml->schema = pstrdup(schema2);
-		else
-			olrdml->schema = pstrdup("public");
-	}
-	else
-	{
-		/* by default, remote's db is mapped to schema in pg */
-		olrdml->schema = pstrdup(db);
-		olrdml->table = pstrdup(table);
-
-		fc_normalize_name(synchdb_letter_casing_strategy, olrdml->schema, strlen(olrdml->schema));
-		fc_normalize_name(synchdb_letter_casing_strategy, olrdml->table, strlen(olrdml->table));
-
-		resetStringInfo(&strinfo);
-		appendStringInfo(&strinfo, "%s.%s", olrdml->schema, olrdml->table);
-		olrdml->mappedObjectId = pstrdup(strinfo.data);
-	}
-
-	/* Target keys must fit PostgreSQL identifiers; sources require an explicit
-	 * mapping when their names exceed that limit. Never truncate cache keys. */
-	if (strlen(olrdml->schema) >= NAMEDATALEN ||
-		strlen(olrdml->table) >= NAMEDATALEN)
-		ereport(ERROR, (errcode(ERRCODE_NAME_TOO_LONG),
-						errmsg("target schema or table name exceeds PostgreSQL's identifier limit")));
+	/* Resolve the same destination as TRUNCATE and Debezium rows. Splitting
+	 * mapping SQL on dots leaves quotes in catalog names and also breaks dots
+	 * inside quoted identifiers. The binder returns the actual locked table. */
+	rel = synchdb_bind_source_table(db, schema, table, RowExclusiveLock);
+	olrdml->tableoid = RelationGetRelid(rel);
+	olrdml->schema = get_namespace_name(RelationGetNamespace(rel));
+	olrdml->table = pstrdup(RelationGetRelationName(rel));
+	olrdml->mappedObjectId = quote_qualified_identifier(olrdml->schema, olrdml->table);
+	table_close(rel, NoLock);
 
 	/* prepare cache key */
 	strlcpy(cachekey.schema, olrdml->schema, sizeof(cachekey.schema));
 	strlcpy(cachekey.table, olrdml->table, sizeof(cachekey.table));
 
 	cacheentry = (DataCacheEntry *) hash_search(dataCacheHash, &cachekey, HASH_ENTER, &found);
-	if (found && (!cacheentry->typeidhash || !cacheentry->namejsonposhash))
+	if (found && (cacheentry->tableoid != olrdml->tableoid ||
+				  !cacheentry->typeidhash || !cacheentry->namejsonposhash))
 	{
-		/* An earlier missing-target error/skip may have left no usable schema. */
+		/* The same name may now identify another table, or an earlier failed
+		 * lookup may have left no usable schema. Never reuse either cache. */
 		if (cacheentry->typeidhash)
 			hash_destroy(cacheentry->typeidhash);
 		fc_destroy_source_column_cache(cacheentry->namejsonposhash);
@@ -1574,48 +1538,6 @@ parseOLRDML(Jsonb * jb, char op, Jsonb * payload, orascn * scn, orascn * c_scn, 
 		cacheentry->namejsonposhash = NULL;
 		cacheentry->tableoid = InvalidOid;
 		cacheentry->natts = 0;
-
-		schemaoid = get_namespace_oid(olrdml->schema, true);
-		if (!OidIsValid(schemaoid))
-		{
-			char * msg = palloc0(SYNCHDB_ERRMSG_SIZE);
-			snprintf(msg, SYNCHDB_ERRMSG_SIZE, "no valid OID found for schema '%s'", olrdml->schema);
-			set_shm_connector_errmsg(myConnectorId, msg);
-
-			if (synchdb_log_event_on_error && g_eventStr != NULL)
-				elog(LOG, "%s", g_eventStr);
-
-			/* act based on error strategy */
-			if (synchdb_error_strategy == STRAT_EXIT_ON_ERROR)
-				elog(ERROR, "%s", msg);
-			else
-			{
-				destroyOLRDML(olrdml);
-				olrdml = NULL;
-				goto end;
-			}
-		}
-
-		olrdml->tableoid = get_relname_relid(olrdml->table, schemaoid);
-		if (!OidIsValid(olrdml->tableoid))
-		{
-			char * msg = palloc0(SYNCHDB_ERRMSG_SIZE);
-			snprintf(msg, SYNCHDB_ERRMSG_SIZE, "no valid OID found for table '%s'", olrdml->table);
-			set_shm_connector_errmsg(myConnectorId, msg);
-
-			if (synchdb_log_event_on_error && g_eventStr != NULL)
-				elog(LOG, "%s", g_eventStr);
-
-			/* act based on error strategy */
-			if (synchdb_error_strategy == STRAT_EXIT_ON_ERROR)
-				elog(ERROR, "%s", msg);
-			else
-			{
-				destroyOLRDML(olrdml);
-				olrdml = NULL;
-				goto end;
-			}
-		}
 
 		/* populate cached information */
 		strlcpy(cacheentry->key.schema, olrdml->schema, sizeof(cachekey.schema));

@@ -251,6 +251,24 @@ def verify_default_type_mappings(exttype, pgtype, dbvendor):
     print(f"type unmatched: {exttype} : {pgtype} for {dbvendor}")
     return False
 
+def run_remote_statements(where, statements, srcdb=None):
+    """Run ordinary SQL statements in one client session, one per line.
+
+    SQL*Plus does not accept ``INSERT ...; COMMIT`` on one input line.
+    Keep statement boundaries explicit instead of splitting SQL text, which
+    would also split semicolons inside quoted values or procedural blocks.
+    This helper is for ordinary SQL, not SQL*Plus commands or PL/SQL blocks.
+    """
+    if not isinstance(statements, (list, tuple)) or not statements:
+        raise ValueError("provide a non-empty list of SQL statements")
+    commands = []
+    for statement in statements:
+        if not isinstance(statement, str) or not statement.strip():
+            raise ValueError("SQL statements must be non-empty strings")
+        commands.append(statement.strip().removesuffix(";"))
+    return run_remote_query(where, ";\n".join(commands), srcdb=srcdb)
+
+
 def run_remote_query(where, query, srcdb=None):
     db = srcdb or {
         "mysql": MYSQL_DB,

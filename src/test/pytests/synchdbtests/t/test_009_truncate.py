@@ -43,7 +43,8 @@ def test_TruncateMappedTable(pg_cursor, dbvendor, use_spi, skip_truncate):
         common.run_remote_query(dbvendor,
             f"CREATE TABLE {source_table} (id INTEGER PRIMARY KEY, payload VARCHAR(32))")
         source_created = True
-        common.run_remote_query(dbvendor, f"INSERT INTO {source_table} VALUES (1,'before'); COMMIT")
+        common.run_remote_statements(dbvendor, [
+            f"INSERT INTO {source_table} VALUES (1,'before')", "COMMIT"])
 
         database, schema = common.getDbname(dbvendor), common.getSchema(dbvendor)
         source_name = source_table if dbvendor in ("mysql", "postgres") else source_table.upper()
@@ -65,14 +66,15 @@ def test_TruncateMappedTable(pg_cursor, dbvendor, use_spi, skip_truncate):
         if dbvendor == "postgres":
             # A rolled-back source TRUNCATE must not clear the target. The
             # subsequent committed row proves the source stream has caught up.
-            common.run_remote_query(dbvendor,
-                f"BEGIN; TRUNCATE TABLE {source_table}; ROLLBACK; "
-                f"INSERT INTO {source_table} VALUES (11,'after rollback')")
+            common.run_remote_statements(dbvendor, [
+                "BEGIN", f"TRUNCATE TABLE {source_table}", "ROLLBACK",
+                f"INSERT INTO {source_table} VALUES (11,'after rollback')"])
             before.append((11, "after rollback"))
             _wait_rows(pg_cursor, name, target, before)
 
         common.run_remote_query(dbvendor, f"TRUNCATE TABLE {source_table}")
-        common.run_remote_query(dbvendor, f"INSERT INTO {source_table} VALUES (2,'after'); COMMIT")
+        common.run_remote_statements(dbvendor, [
+            f"INSERT INTO {source_table} VALUES (2,'after')", "COMMIT"])
         expected = sorted(before + [(2, "after")]) if skip_truncate else [(2, "after")]
         _wait_rows(pg_cursor, name, target, expected)
         pg_cursor.execute("SELECT truncates FROM synchdb_cdcstats WHERE name=%s", (name,))
@@ -112,9 +114,9 @@ def test_TruncateFailureAndResume(pg_cursor, dbvendor, use_spi):
     try:
         common.update_guc_conf(pg_cursor, "synchdb.dml_use_spi", "on" if use_spi else "off", True)
         common.update_guc_conf(pg_cursor, "synchdb.dbz_skipped_operations", "'none'", True)
-        common.run_remote_query(dbvendor,
-            f"CREATE TABLE {source_table} (id INTEGER PRIMARY KEY, payload VARCHAR(32)); "
-            f"INSERT INTO {source_table} VALUES (1,'before')")
+        common.run_remote_statements(dbvendor, [
+            f"CREATE TABLE {source_table} (id INTEGER PRIMARY KEY, payload VARCHAR(32))",
+            f"INSERT INTO {source_table} VALUES (1,'before')"])
         source_created = True
         pg_cursor.execute('CREATE SCHEMA "truncate recovery"')
         pg_cursor.execute(f"CREATE TABLE {target} (id INTEGER PRIMARY KEY, payload VARCHAR(32))")
@@ -130,8 +132,8 @@ def test_TruncateFailureAndResume(pg_cursor, dbvendor, use_spi):
             BEGIN RAISE EXCEPTION 'reject truncate test'; END $$''')
         pg_cursor.execute(f'''CREATE TRIGGER reject_truncate BEFORE TRUNCATE ON {target}
             EXECUTE FUNCTION "truncate recovery".reject_truncate()''')
-        common.run_remote_query(dbvendor, f"TRUNCATE TABLE {source_table}; "
-            f"INSERT INTO {source_table} VALUES (2,'after')")
+        common.run_remote_statements(dbvendor, [f"TRUNCATE TABLE {source_table}",
+            f"INSERT INTO {source_table} VALUES (2,'after')"])
         deadline = time.monotonic() + 300
         while True:
             pg_cursor.execute("SELECT actual_state,last_sqlstate,last_error FROM synchdb_control_view WHERE name=%s", (name,))

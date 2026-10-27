@@ -173,6 +173,22 @@ function build_synchdb()
 	LD_LIBRARY_PATH="${installdir}/usr/local/lib:${LD_LIBRARY_PATH:-}" \
 		bash "${basedir}/ci/check-extension-load.sh" "${pgconfig}"
 
+	# Fail before publishing build artifacts or provisioning any source DB.
+	# These production-code event tests need only this freshly built target.
+	if [ "${SYNCHDB_CI_EVENT_TESTS:-0}" = "1" ]; then
+		(
+			cd "${srcdir}/contrib/synchdb"
+			export SYNCHDB_TARGET_BIN="${prefix}/bin"
+			export SYNCHDB_TEST_TARGET_FLAVOR="${TARGET_FLAVOR}"
+			export PROTOBUF_C_INCLUDE_DIR="${installdir}/usr/local/include"
+			export PROTOBUF_C_LIB_DIR="${installdir}/usr/local/lib"
+			export LD_LIBRARY_PATH="${installdir}/usr/local/lib:${LD_LIBRARY_PATH:-}"
+			# Both variants share object files and must run sequentially.
+			SYNCHDB_TEST_WITH_OLR=0 python3 -m pytest -q src/test/pytests/truncate
+			SYNCHDB_TEST_WITH_OLR=1 python3 -m pytest -q src/test/pytests/truncate
+		)
+	fi
+
 	cd "$installdir"
 	tar czvf "${artifact}.tar.gz" *
 	mv "${artifact}.tar.gz" "$basedir"

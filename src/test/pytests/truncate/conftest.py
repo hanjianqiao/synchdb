@@ -20,6 +20,7 @@ def database(tmp_path_factory):
     bindir = Path(configured) if configured else Path(
         subprocess.check_output(["pg_config", "--bindir"], text=True).strip())
     config = bindir / "pg_config"
+    version = subprocess.check_output([config, "--version"], text=True)
     module = work / "truncate_test.so"
     env = os.environ.copy()
     java = Path(shutil.which("java")).resolve().parents[1]
@@ -40,6 +41,11 @@ def database(tmp_path_factory):
         conf.write(f"\nshared_preload_libraries='{module}'\n"
                    f"unix_socket_directories='{work}'\nlisten_addresses=''\n"
                    "synchdb.synchdb_auto_launcher=off\nmax_worker_processes=24\n")
+        if (os.environ.get("SYNCHDB_TEST_TARGET_FLAVOR") == "ivorysql" or
+                "ivorysql" in version.lower()):
+            # These tests assert PostgreSQL identifier semantics, matching the
+            # live suite rather than IvorySQL's default Oracle-compatible mode.
+            conf.write("ivorysql.compatible_mode='pg'\n")
     started = False
     try:
         subprocess.run([bindir / "pg_ctl", "-D", data, "-l", work / "postgres.log",

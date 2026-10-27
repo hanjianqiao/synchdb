@@ -288,6 +288,45 @@ def test_native_quoted_case_is_preserved(db):
 
 
 @pytest.mark.skipif(not WITH_OLR, reason="requires SYNCHDB_TEST_WITH_OLR=1")
+@pytest.mark.parametrize("schema,table", [
+    ("truncate target", 'table "data'),
+    ("truncate.target", "table.data"),
+    ("MiXeD", "Case")])
+def test_native_truncate_followed_by_mapped_insert(db, schema, table):
+    from psycopg2 import sql
+
+    target = sql.Identifier(schema, table).as_string(db)
+    db.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
+    try:
+        db.execute(f"CREATE TABLE {target}(id integer PRIMARY KEY,value text)")
+        db.execute(f"INSERT INTO {target} VALUES (1,'before')")
+        insert = native()
+        insert.update(scn=101, c_scn=101, c_idx=2)
+        insert["payload"][0] = {"op": "c", "schema": {
+            "owner": "SRC", "table": "ITEMS", "columns": [
+                {"name": "ID", "type": "number", "precision": -1,
+                 "scale": 0, "nullable": False},
+                {"name": "VALUE", "type": "varchar2", "length": 32,
+                 "nullable": True}]}, "after": {"ID": 2, "VALUE": "after"}}
+        update = copy.deepcopy(insert)
+        update["payload"][0].update(op="u", before={"ID": 2, "VALUE": "after"},
+            after={"ID": 2, "VALUE": "updated"})
+        delete = copy.deepcopy(insert)
+        delete["payload"][0].update(op="d", before={"ID": 2, "VALUE": "updated"})
+        del delete["payload"][0]["after"]
+        last = copy.deepcopy(insert)
+        last["payload"][0]["after"] = {"ID": 3, "VALUE": "final"}
+        for position, record in enumerate([insert, update, delete, last], start=101):
+            record.update(scn=position, c_scn=position, c_idx=1)
+        assert apply(db, [native(), insert, update, delete, last], native=True, mapped=target) == {
+            "truncates": 1, "ddls": 1, "bad": 0}
+        assert rows(db, target) == [(3, "final")]
+        assert rows(db) == [(1, "before")]
+    finally:
+        db.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
+
+
+@pytest.mark.skipif(not WITH_OLR, reason="requires SYNCHDB_TEST_WITH_OLR=1")
 def test_native_keyword_as_table_name(db):
     db.execute("CREATE TABLE fixture.reuse(id int); INSERT INTO fixture.reuse VALUES(2)")
     assert apply(db, native("TRUNCATE TABLE SRC.REUSE DROP STORAGE", "REUSE"), native=True)["truncates"] == 1
