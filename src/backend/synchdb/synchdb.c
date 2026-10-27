@@ -123,7 +123,8 @@ bool synchdb_dml_use_spi = false;
 static bool synchdb_auto_launcher = true;
 static int dbz_batch_size = 2048;
 static int dbz_queue_size = 8192;
-char * dbz_skipped_operations = "t";
+static char *dbz_skipped_operations = "none"; /* Historical misspelled GUC. */
+static char *dbz_skipped_operations_setting = NULL;
 static int dbz_connect_timeout_ms = 30000;
 static int dbz_query_timeout_ms = 600000;
 static int jvm_max_heap_size = 1024;
@@ -612,21 +613,43 @@ synchdb_detach_shmem(int code, Datum arg)
 	synchdb_worker_finalize(context, code);
 }
 
+/* The correctly spelled setting wins when both names are explicitly set. */
+static const char *
+configured_skipped_operations(void)
+{
+	return dbz_skipped_operations_setting != NULL ?
+		dbz_skipped_operations_setting : dbz_skipped_operations;
+}
+
+bool
+synchdb_operation_skipped(char operation)
+{
+	const SynchdbRunOptions *options = &worker.run.spec.connection.run_options;
+	const char *operations = options->version == SYNCHDB_RUN_OPTIONS_VERSION ?
+		options->dbz_skipped_operations : configured_skipped_operations();
+
+	return operations != NULL && strchr(operations, operation) != NULL;
+}
+
 /* Capture caller settings once; worker retries keep this accepted snapshot. */
 static void
 capture_run_options(SynchdbRunOptions *options)
 {
+	const char *skipped = configured_skipped_operations();
+
 	MemSet(options, 0, sizeof(*options));
 	options->version = SYNCHDB_RUN_OPTIONS_VERSION;
 	options->dbz_batch_size = dbz_batch_size;
 	options->dbz_queue_size = dbz_queue_size;
 	options->dbz_connect_timeout_ms = dbz_connect_timeout_ms;
 	options->dbz_query_timeout_ms = dbz_query_timeout_ms;
-	if (!dbz_skipped_operations || strlen(dbz_skipped_operations) >= sizeof(options->dbz_skipped_operations))
+	if (!skipped || strlen(skipped) >= sizeof(options->dbz_skipped_operations))
 		ereport(ERROR,
 				(errcode(ERRCODE_STRING_DATA_RIGHT_TRUNCATION),
 				 errmsg("run option \"dbz_skipped_operations\" exceeds its supported length")));
-	strlcpy(options->dbz_skipped_operations, dbz_skipped_operations, sizeof(options->dbz_skipped_operations));
+	/* Debezium's list parser requires "none", rather than an empty list. */
+	strlcpy(options->dbz_skipped_operations, skipped[0] ? skipped : "none",
+			sizeof(options->dbz_skipped_operations));
 	options->dbz_snapshot_thread_num = dbz_snapshot_thread_num;
 	options->dbz_snapshot_fetch_size = dbz_snapshot_fetch_size;
 	options->dbz_snapshot_min_row_to_stream_results = dbz_snapshot_min_row_to_stream_results;
@@ -2577,9 +2600,35 @@ get_shm_ora_compat(int connectorId)
 	return read_connector_view(connectorId, &view) && view.isOraCompat;
 }
 
-/*
- * _PG_init - Initialize the SynchDB extension
- */
+static bool
+check_skipped_operations(char **value, void **extra, GucSource source)
+{
+	const char *at = *value;
+
+	if (at == NULL || at[0] == '\0' || pg_strcasecmp(at, "none") == 0)
+		return true;
+	for (;;)
+	{
+		at += strspn(at, " \t\r\n");
+		if (*at == '\0' || strchr("cudt", *at) == NULL)
+			break;
+		at++;
+		at += strspn(at, " \t\r\n");
+		if (*at == '\0')
+			return true;
+		if (*at++ != ',')
+			break;
+	}
+	GUC_check_errdetail("Use none, an empty string, or a comma-separated list of c, u, d and t.");
+	return false;
+}
+
+static const char *
+show_skipped_operations(void)
+{
+	return configured_skipped_operations();
+}
+
 static bool
 check_connector_capacity(int *value, void **extra, GucSource source)
 {
@@ -2659,15 +2708,26 @@ _PG_init(void)
 							0,
 							NULL, NULL, NULL);
 
-	DefineCustomStringVariable("synchdb.dbz_skipped_oeprations",
+	DefineCustomStringVariable("synchdb.dbz_skipped_operations",
 							   "a comma-separated list of operations Debezium shall skip: "
 							   "c for inserts, u for updates, d for deletes, t for truncates",
 							   NULL,
-							   &dbz_skipped_operations,
-							   "t",
+							   &dbz_skipped_operations_setting,
+							   NULL,
 							   PGC_SIGHUP,
 							   0,
-							   NULL, NULL, NULL);
+							   check_skipped_operations, NULL, show_skipped_operations);
+
+	/* Existing configurations retain their historical spelling. An unset
+	 * canonical setting falls back to this value, including after a reload. */
+	DefineCustomStringVariable("synchdb.dbz_skipped_oeprations",
+							   "legacy spelling of synchdb.dbz_skipped_operations",
+							   NULL,
+							   &dbz_skipped_operations,
+							   "none",
+							   PGC_SIGHUP,
+							   GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
+							   check_skipped_operations, NULL, show_skipped_operations);
 
 	DefineCustomIntVariable("synchdb.jvm_max_heap_size",
 							"max heap size allocated to JVM",

@@ -25,7 +25,11 @@ char *
 olr_json_text(Jsonb *object, const char *field)
 {
 	JsonbValue buffer;
-	JsonbValue *value = getKeyJsonValueFromContainer(&object->root, field, strlen(field), &buffer);
+	JsonbValue *value;
+
+	if (object == NULL || !JB_ROOT_IS_OBJECT(object))
+		elog(ERROR, "OLR field %s requires an object", field);
+	value = getKeyJsonValueFromContainer(&object->root, field, strlen(field), &buffer);
 
 	if (!value || value->type != jbvString)
 		elog(ERROR, "OLR field %s must be a string", field);
@@ -36,11 +40,14 @@ uint64
 olr_json_uint(Jsonb *object, const char *field)
 {
 	JsonbValue buffer;
-	JsonbValue *value = getKeyJsonValueFromContainer(&object->root, field, strlen(field), &buffer);
+	JsonbValue *value;
 	char *text;
 	char *end;
 	unsigned long long result;
 
+	if (object == NULL || !JB_ROOT_IS_OBJECT(object))
+		elog(ERROR, "OLR field %s requires an object", field);
+	value = getKeyJsonValueFromContainer(&object->root, field, strlen(field), &buffer);
 	if (!value || (value->type != jbvNumeric && value->type != jbvString))
 		elog(ERROR, "OLR field %s must be an unsigned integer", field);
 	text = value->type == jbvString ? pnstrdup(value->val.string.val, value->val.string.len) :
@@ -59,10 +66,14 @@ olr_json_payload(Jsonb *record)
 	Datum path[] = {CStringGetTextDatum("payload")};
 	Jsonb *array = GET_JSONB_ELEM(record, path, 1);
 	Datum first[] = {CStringGetTextDatum("payload"), CStringGetTextDatum("0")};
+	Jsonb *payload;
 
 	if (!array || !JB_ROOT_IS_ARRAY(array) || JsonContainerSize(&array->root) != 1)
 		elog(ERROR, "OLR handoff requires one payload per message (format.message=2)");
-	return GET_JSONB_ELEM(record, first, 2);
+	payload = GET_JSONB_ELEM(record, first, 2);
+	if (!payload || !JB_ROOT_IS_OBJECT(payload))
+		elog(ERROR, "OLR payload must be an object");
+	return payload;
 }
 
 static void

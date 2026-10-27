@@ -67,6 +67,7 @@ OBJS = src/backend/synchdb/synchdb.o \
        src/backend/source/debezium_frame.o \
        src/backend/source/json_input.o \
        src/backend/source/debezium_event.o \
+       src/backend/source/truncate_sql.o \
        src/backend/source/debezium_row.o \
        src/backend/source/debezium_logical.o \
        src/backend/source/debezium_unavailable.o \
@@ -88,6 +89,7 @@ OBJS = src/backend/synchdb/synchdb.o \
        src/backend/executor/spi_writer.o \
        src/backend/executor/tuple_writer.o \
        src/backend/executor/target_validate.o \
+       src/backend/executor/truncate.o \
        src/backend/executor/pg_compat.o \
        src/backend/executor/row_identity.o \
        src/backend/executor/batch_apply.o
@@ -152,6 +154,15 @@ include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/contrib/contrib-global.mk
 PG_MAJOR := $(MAJORVERSION)
 endif
+
+# Test-only module. Reuse production objects; the fixture supplies accepted run
+# rules and an OLR handoff boundary without contacting a source or acknowledging
+# anything. The module is built only on explicit request and is never installed.
+.PHONY: truncate-test-module
+truncate-test-module: $(OBJS) $(DATA_built)
+	@test -n "$(TRUNCATE_TEST_MODULE)" || { echo 'Set TRUNCATE_TEST_MODULE to a private output path'; exit 1; }
+	$(CC) $(CFLAGS) $(CPPFLAGS) -fPIC -c src/test/pytests/truncate/harness.c -o "$(TRUNCATE_TEST_MODULE).o"
+	$(CC) $(CFLAGS) -shared -o "$(TRUNCATE_TEST_MODULE)" "$(TRUNCATE_TEST_MODULE).o" $(filter-out src/backend/converter/rule_snapshot.o src/backend/converter/olr_event_handler.o,$(OBJS)) $(PG_LDFLAGS) $(LDFLAGS)
 
 # Make does not track command-line compiler flag changes. Rebuild both native
 # and LLVM objects when switching OLR support, including an existing default

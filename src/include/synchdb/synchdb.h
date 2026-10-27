@@ -432,7 +432,7 @@ typedef struct _CDCStatistics
 	unsigned long long stats_update;			/* applied target UPDATE rows during CDC */
 	unsigned long long stats_delete;			/* applied target DELETE rows during CDC */
 	unsigned long long stats_tx;				/* transaction boundary events like BEGIN and COMMIT */
-	unsigned long long stats_truncate;			/* TRUNCATE events generated during CDC */
+	unsigned long long stats_truncate;			/* successfully applied table TRUNCATE events */
 } CDCStatistics;
 
 typedef struct _GeneralStatistics

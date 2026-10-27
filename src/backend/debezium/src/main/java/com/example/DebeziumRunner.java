@@ -745,7 +745,8 @@ public class DebeziumRunner {
 			props.setProperty("record.processing.order", "ORDERED");
 			/* Custom batch consumers bypass record.processing.order in Debezium 3.5.2. */
 			props.setProperty("tasks.max", "1");
-			props.setProperty("skipped.operations", myParameters.skippedOperations);
+			props.setProperty("skipped.operations", myParameters.skippedOperations == null ||
+					myParameters.skippedOperations.trim().isEmpty() ? "none" : myParameters.skippedOperations);
 			props.setProperty("connect.timeout", String.valueOf(myParameters.connectTimeout));
 			props.setProperty("database.query.timeout", String.valueOf(myParameters.queryTimeout));
 			props.setProperty("snapshot.max.threads", String.valueOf(myParameters.snapshotThreadNum));

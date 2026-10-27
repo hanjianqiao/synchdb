@@ -79,6 +79,10 @@ typedef DBZ_DDL_COLUMN OLR_DDL_COLUMN;
 typedef struct dbz_ddl
 {
 	char * id;
+	/* Native table-wide operations retain source spelling for rule lookup. */
+	char *source_database;
+	char *source_schema;
+	char *source_table;
 	DdlType type;
 	AlterSubType subtype;
 	char * primaryKeyColumnNames;

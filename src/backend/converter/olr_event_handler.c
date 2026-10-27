@@ -30,6 +30,9 @@
 
 #include "converter/olr_event_handler.h"
 #include "converter/format_converter.h"
+#include "converter/debezium_bind.h"
+#include "executor/truncate.h"
+#include "source/truncate_sql.h"
 #include "olr/olr_client.h"
 #include "runtime/config.h"
 #include "olr/olr_handoff.h"
@@ -157,8 +160,7 @@ is_whitelist_sql(StringInfoData *sql)
 	create = pg_strcasecmp(command, "CREATE") == 0;
 	drop = pg_strcasecmp(command, "DROP") == 0;
 	alter = pg_strcasecmp(command, "ALTER") == 0;
-	allowed = create || drop || alter ||
-		pg_strcasecmp(command, "TRUNCATE") == 0;
+	allowed = create || drop || alter;
 	if (!core_yylex(&value, &location, scanner))
 		allowed = false;
 	else
@@ -297,6 +299,12 @@ destroyOLRDDL(OLR_DDL * ddlinfo)
 	{
 		if (ddlinfo->id)
 			pfree(ddlinfo->id);
+		if (ddlinfo->source_database)
+			pfree(ddlinfo->source_database);
+		if (ddlinfo->source_schema)
+			pfree(ddlinfo->source_schema);
+		if (ddlinfo->source_table)
+			pfree(ddlinfo->source_table);
 
 		if (ddlinfo->primaryKeyColumnNames)
 			pfree(ddlinfo->primaryKeyColumnNames);
@@ -339,6 +347,47 @@ destroyOLRDML(OLR_DML * dmlinfo)
 	}
 }
 
+static void
+load_oracle_parser(void)
+{
+	if (synchdb_oracle_raw_parser == NULL)
+	{
+		char * oralib_path = NULL, * error = NULL;
+
+		oralib_path = psprintf("%s/%s", pkglib_path, ORACLE_RAW_PARSER_LIB);
+
+		/*
+		 * RTLD_LOCAL keeps the parser's internal ora_* symbols private to
+		 * the library so they do not collide with IvorySQL's built-in
+		 * Oracle parser (which exports the same names).  We only use the
+		 * uniquely named synchdb_oracle_raw_parser entry via dlsym(), which
+		 * works through the explicit handle regardless of LOCAL/GLOBAL.
+		 */
+		handle = dlopen(oralib_path, RTLD_NOW | RTLD_LOCAL);
+		if (!handle)
+		{
+			set_shm_connector_errmsg(myConnectorId, "failed to load oracle_parser.so");
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("failed to load oracle_parser.so at %s", oralib_path),
+					 errhint("%s",  dlerror())));
+
+		}
+		pfree(oralib_path);
+
+		synchdb_oracle_raw_parser = (oracle_raw_parser_fn) dlsym(handle, "synchdb_oracle_raw_parser");
+		if ((error = dlerror()) != NULL)
+		{
+			set_shm_connector_errmsg(myConnectorId, "failed to load synchdb_oracle_raw_parser symbol");
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("failed to load synchdb_oracle_raw_parser function symbol"),
+					 errhint("make sure synchdb_oracle_raw_parser() function in libsynchdb_oracle_parser.so is "
+							 "publicly accessible ")));
+		}
+	}
+}
+
 /*
  * parseOLRDDL
  */
@@ -355,10 +404,11 @@ parseOLRDDL(Jsonb * jb, Jsonb * payload, orascn * scn, orascn * c_scn, orascn * 
 	StringInfoData sql;
 	List * ptree = NULL;
 	ListCell * cell;
+	SynchdbSourceName truncate_name;
 
 	/* scn - required */
 	v = getKeyJsonValueFromContainer(&jb->root, "scn", strlen("scn"), &vbuf);
-	if (!v)
+	if (!v || v->type != jbvNumeric)
 	{
 		elog(WARNING, "malformed change request - no scn value");
 		goto end;
@@ -367,7 +417,7 @@ parseOLRDDL(Jsonb * jb, Jsonb * payload, orascn * scn, orascn * c_scn, orascn * 
 
 	/* commit scn - required */
 	v = getKeyJsonValueFromContainer(&jb->root, "c_scn", strlen("c_scn"), &vbuf);
-	if (!v)
+	if (!v || v->type != jbvNumeric)
 	{
 		elog(WARNING, "malformed change request - no c_scn value");
 		goto end;
@@ -376,7 +426,7 @@ parseOLRDDL(Jsonb * jb, Jsonb * payload, orascn * scn, orascn * c_scn, orascn * 
 
 	/* commit index - required */
 	v = getKeyJsonValueFromContainer(&jb->root, "c_idx", strlen("c_idx"), &vbuf);
-	if (!v)
+	if (!v || v->type != jbvNumeric)
 	{
 		elog(WARNING, "malformed change request - no c_idx value");
 		goto end;
@@ -385,7 +435,7 @@ parseOLRDDL(Jsonb * jb, Jsonb * payload, orascn * scn, orascn * c_scn, orascn * 
 
 	/* db - required */
 	v = getKeyJsonValueFromContainer(&jb->root, "db", strlen("db"), &vbuf);
-	if (!v)
+	if (!v || v->type != jbvString || v->val.string.len == 0)
 	{
 		elog(WARNING, "malformed change request - no db value");
 		goto end;
@@ -394,7 +444,7 @@ parseOLRDDL(Jsonb * jb, Jsonb * payload, orascn * scn, orascn * c_scn, orascn * 
 
 	/* fetch payload.0.schema */
 	jbschema = GET_JSONB_ELEM(payload, &datum_path_schema[0], 1);
-	if (!jbschema)
+	if (!jbschema || !JB_ROOT_IS_OBJECT(jbschema))
 	{
 		elog(WARNING, "malformed change request - no payload.0.schema struct");
 		goto end;
@@ -402,7 +452,7 @@ parseOLRDDL(Jsonb * jb, Jsonb * payload, orascn * scn, orascn * c_scn, orascn * 
 
 	/* fetch owner -> considered schema - optional*/
 	v = getKeyJsonValueFromContainer(&jbschema->root, "owner", strlen("owner"), &vbuf);
-	if (v)
+	if (v && v->type == jbvString && v->val.string.len > 0)
 	{
 		schema = pnstrdup(v->val.string.val, v->val.string.len);
 
@@ -422,7 +472,7 @@ parseOLRDDL(Jsonb * jb, Jsonb * payload, orascn * scn, orascn * c_scn, orascn * 
 
 	/* fetch payload.0.schema.table - required */
 	v = getKeyJsonValueFromContainer(&jbschema->root, "table", strlen("table"), &vbuf);
-	if (!v)
+	if (!v || v->type != jbvString || v->val.string.len == 0)
 	{
 		elog(WARNING, "malformed change request - no payload.0.schema.table value");
 		goto end;
@@ -438,13 +488,41 @@ parseOLRDDL(Jsonb * jb, Jsonb * payload, orascn * scn, orascn * c_scn, orascn * 
 	/* fetch sql - required */
 	initStringInfo(&sql);
 	v = getKeyJsonValueFromContainer(&payload->root, "sql", strlen("sql"), &vbuf);
-	if (!v)
+	if (!v || v->type != jbvString || v->val.string.len == 0)
 	{
 		elog(WARNING, "malformed change request - no payload.0.sql value");
 		goto end;
 	}
 
 	appendBinaryStringInfo(&sql, v->val.string.val, v->val.string.len);
+
+	/* A table-wide source event has no columns and needs no Oracle parser.
+	 * Validate the whole statement and its exact source identity before binding
+	 * any target. Quoted Oracle names are case sensitive. */
+	if (synchdb_source_parse_truncate(sql.data, "oracle", &truncate_name))
+	{
+		synchdb_source_check_truncate_name(&truncate_name, "oracle", db, schema, table);
+		if (synchdb_operation_skipped('t'))
+		{
+			elog(LOG, "skipping source TRUNCATE for %s.%s by configured operation policy",
+				 db, table);
+			*ignored = true;
+			goto end;
+		}
+		olrddl = palloc0(sizeof(*olrddl));
+		olrddl->type = DDL_TRUNCATE_TABLE;
+		olrddl->source_database = pstrdup(db);
+		olrddl->source_schema = pstrdup(schema);
+		olrddl->source_table = pstrdup(table);
+		if (isfirst || islast)
+		{
+			v = getKeyJsonValueFromContainer(&jb->root, "tm", strlen("tm"), &vbuf);
+			if (v && v->type == jbvNumeric)
+				olrddl->src_ts_ms = DatumGetUInt64(DirectFunctionCall1(numeric_int8,
+					NumericGetDatum(v->val.numeric))) / 1000 / 1000;
+		}
+		return olrddl;
+	}
 
 	if (!is_whitelist_sql(&sql))
 	{
@@ -455,6 +533,9 @@ parseOLRDDL(Jsonb * jb, Jsonb * payload, orascn * scn, orascn * c_scn, orascn * 
 
 	/* construct the ddl struct */
 	olrddl = (DBZ_DDL*) palloc0(sizeof(DBZ_DDL));
+	olrddl->source_database = pstrdup(db);
+	olrddl->source_schema = pstrdup(schema);
+	olrddl->source_table = pstrdup(table);
 
 	/* tm - only on first and last record within a batch */
 	if (isfirst || islast)
@@ -466,6 +547,7 @@ parseOLRDDL(Jsonb * jb, Jsonb * payload, orascn * scn, orascn * c_scn, orascn * 
 					NumericGetDatum(v->val.numeric))) / 1000 / 1000;
 		}
 	}
+	load_oracle_parser();
 	/* Parse the Oracle SQL */
 	PG_TRY();
 	{
@@ -494,6 +576,10 @@ parseOLRDDL(Jsonb * jb, Jsonb * payload, orascn * scn, orascn * c_scn, orascn * 
 		goto end;
 	}
 	PG_END_TRY();
+
+	if (list_length(ptree) != 1)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("native OLR DDL requires one SQL statement per event")));
 
 	foreach(cell, ptree)
 	{
@@ -1240,44 +1326,6 @@ parseOLRDDL(Jsonb * jb, Jsonb * payload, orascn * scn, orascn * c_scn, orascn * 
 			}
 			else
 				elog(WARNING, "unsupported drop type %d", dropStmt->removeType);
-		}
-		else if (IsA(stmt, TruncateStmt))
-		{
-			TruncateStmt *truncateStmt = (TruncateStmt *)stmt;
-			ListCell *objCell;
-			olrddl->type = DDL_TRUNCATE_TABLE;
-
-			if (strstr(dbz_skipped_operations, "t"))
-			{
-				elog(WARNING, "truncate support is not enabled. Remove 't' from "
-						"dbz_skipped_operations GUC to support it");
-				destroyOLRDDL(olrddl);
-				olrddl = NULL;
-				goto end;
-			}
-
-			/* we only expect one entry from this list */
-			if (list_length(truncateStmt->relations) > 1)
-			{
-				elog(WARNING, "truncate more than 1 relations is not supported (%d)",
-						list_length(truncateStmt->relations));
-				destroyOLRDDL(olrddl);
-				olrddl = NULL;
-				goto end;
-			}
-
-			foreach (objCell, truncateStmt->relations)
-			{
-				RangeVar *rv = lfirst(objCell);
-				elog(WARNING, "truncate rv.relname %s", rv->relname);
-
-				/* replace table with the new value to be truncated */
-				if(table)
-				{
-					pfree(table);
-					table = pstrdup(rv->relname);
-				}
-			}
 		}
 		else
 		{
@@ -2464,46 +2512,6 @@ fc_processOLRChangeEvent(void * event, SynchdbStatistics * myBatchStats,
 		bool ignored = false;
 		orascn scn = 0, c_scn = 0, c_idx = 0;
 
-		/* increment batch statistics */
-		increment_connector_statistics(myBatchStats, STATS_DDL, 1);
-
-		/* (1) make sure oracle parser is ready to use - todo move earlier */
-		if (synchdb_oracle_raw_parser == NULL)
-		{
-			char * oralib_path = NULL, * error = NULL;
-
-			oralib_path = psprintf("%s/%s", pkglib_path, ORACLE_RAW_PARSER_LIB);
-
-			/*
-			 * RTLD_LOCAL keeps the parser's internal ora_* symbols private to
-			 * the library so they do not collide with IvorySQL's built-in
-			 * Oracle parser (which exports the same names).  We only use the
-			 * uniquely named synchdb_oracle_raw_parser entry via dlsym(), which
-			 * works through the explicit handle regardless of LOCAL/GLOBAL.
-			 */
-			handle = dlopen(oralib_path, RTLD_NOW | RTLD_LOCAL);
-			if (!handle)
-			{
-				set_shm_connector_errmsg(myConnectorId, "failed to load oracle_parser.so");
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("failed to load oracle_parser.so at %s", oralib_path),
-						 errhint("%s",  dlerror())));
-
-			}
-			pfree(oralib_path);
-
-			synchdb_oracle_raw_parser = (oracle_raw_parser_fn) dlsym(handle, "synchdb_oracle_raw_parser");
-			if ((error = dlerror()) != NULL)
-			{
-				set_shm_connector_errmsg(myConnectorId, "failed to load synchdb_oracle_raw_parser symbol");
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("failed to load synchdb_oracle_raw_parser function symbol"),
-						 errhint("make sure synchdb_oracle_raw_parser() function in libsynchdb_oracle_parser.so is "
-								 "publicly accessible ")));
-			}
-		}
 
 		/* (2) parse */
 		set_shm_connector_state(myConnectorId, STATE_PARSING);
@@ -2523,7 +2531,17 @@ fc_processOLRChangeEvent(void * event, SynchdbStatistics * myBatchStats,
 
     	/* (3) convert */
     	set_shm_connector_state(myConnectorId, STATE_CONVERTING);
-    	pgddl = convert2PGDDL(olrddl, TYPE_OLR);
+		if (olrddl->type == DDL_TRUNCATE_TABLE)
+		{
+			Relation relation = synchdb_bind_source_table(olrddl->source_database,
+					olrddl->source_schema, olrddl->source_table, AccessExclusiveLock);
+
+			set_shm_connector_state(myConnectorId, STATE_EXECUTING);
+			synchdb_execute_truncate(relation);
+			increment_connector_statistics(myBatchStats, STATS_TRUNCATE, 1);
+			goto ddl_applied;
+		}
+		pgddl = convert2PGDDL(olrddl, TYPE_OLR);
     	if (!pgddl)
     	{
     		set_shm_connector_state(myConnectorId, STATE_SYNCING);
@@ -2548,7 +2566,9 @@ fc_processOLRChangeEvent(void * event, SynchdbStatistics * myBatchStats,
     		return -1;
     	}
 
-    	/* (5) record scn, c_scn and processing timestmaps */
+	ddl_applied:
+		increment_connector_statistics(myBatchStats, STATS_DDL, 1);
+		/* (5) record scn, c_scn and processing timestamps */
     	olr_client_set_scns(scn, c_scn, c_idx);
     	* sendconfirm = true;
 
@@ -2567,7 +2587,8 @@ fc_processOLRChangeEvent(void * event, SynchdbStatistics * myBatchStats,
     	}
 
 		/* (6) update attribute map table */
-    	updateSynchdbAttribute(olrddl, pgddl, TYPE_OLR, name);
+		if (pgddl != NULL)
+			updateSynchdbAttribute(olrddl, pgddl, TYPE_OLR, name);
 
     	/* (7) clean up */
     	set_shm_connector_state(myConnectorId, STATE_SYNCING);
@@ -2589,4 +2610,6 @@ unload_oracle_parser(void)
 {
 	if (handle != NULL)
 		dlclose(handle);
+	handle = NULL;
+	synchdb_oracle_raw_parser = NULL;
 }

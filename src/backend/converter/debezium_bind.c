@@ -555,14 +555,63 @@ bind_free_image(List *columns)
 	list_free(columns);
 }
 
+Relation
+synchdb_bind_source_table(const char *database, const char *source_schema,
+						  const char *source_table, LOCKMODE lockmode)
+{
+	char *remote_object_id;
+	char *schema;
+	char *table;
+	char *mapped;
+	Relation relation;
+
+	if (database == NULL || database[0] == '\0' ||
+		source_table == NULL || source_table[0] == '\0')
+		elog(ERROR, "target binding requires a complete source table identity");
+	remote_object_id = synchdb_source_table_key(database, source_schema, source_table);
+	mapped = transform_object_name(remote_object_id, "table");
+	if (mapped != NULL)
+	{
+		char *mapped_database;
+
+		synchdb_rule_parse_target_name(mapped, &mapped_database, &schema, &table);
+		if (mapped_database != NULL)
+		{
+			char *current = get_database_name(MyDatabaseId);
+
+			if (current == NULL || strcmp(mapped_database, current) != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cross-database target table mappings are not supported")));
+			pfree(mapped_database);
+			pfree(current);
+		}
+		pfree(mapped);
+	}
+	else
+	{
+		schema = pstrdup(database);
+		table = pstrdup(source_table);
+		fc_normalize_name(synchdb_letter_casing_strategy, schema, strlen(schema));
+		fc_normalize_name(synchdb_letter_casing_strategy, table, strlen(table));
+	}
+	if (strlen(schema) >= NAMEDATALEN || strlen(table) >= NAMEDATALEN)
+		ereport(ERROR,
+				(errcode(ERRCODE_NAME_TOO_LONG),
+				 errmsg("target schema or table name exceeds PostgreSQL's identifier limit")));
+	relation = table_openrv(makeRangeVar(schema, table, -1), lockmode);
+	synchdb_target_validate_relation(relation);
+	pfree(remote_object_id);
+	pfree(schema);
+	pfree(table);
+	return relation;
+}
+
 SynchdbTargetChange *
 synchdb_bind_dbz_row(const SynchdbDbzRow *row, ConnectorType type)
 {
 	SynchdbTargetChange *bound = palloc0(sizeof(*bound));
 	char *remote_object_id;
-	char *schema;
-	char *table;
-	char *mapped;
 	Relation relation;
 	Bitmapset *keys;
 	BindAttributeLookup attributes = {0};
@@ -571,43 +620,12 @@ synchdb_bind_dbz_row(const SynchdbDbzRow *row, ConnectorType type)
 	List *after = NIL;
 	bool copy_after_identity = false;
 
-	if (row == NULL || row->db == NULL || row->table == NULL)
+	if (row == NULL)
 		elog(ERROR, "target binding requires a decoded Debezium source row");
 	bound->op = row->op;
 	remote_object_id = synchdb_source_table_key(row->db, row->schema, row->table);
-	mapped = transform_object_name(remote_object_id, "table");
-	if (mapped != NULL)
-	{
-		char *database;
-
-		synchdb_rule_parse_target_name(mapped, &database, &schema, &table);
-		if (database != NULL)
-		{
-			char *current = get_database_name(MyDatabaseId);
-
-			if (current == NULL || strcmp(database, current) != 0)
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("cross-database target table mappings are not supported")));
-			pfree(database);
-			pfree(current);
-		}
-		pfree(mapped);
-	}
-	else
-	{
-		schema = pstrdup(row->db);
-		table = pstrdup(row->table);
-		fc_normalize_name(synchdb_letter_casing_strategy, schema, strlen(schema));
-		fc_normalize_name(synchdb_letter_casing_strategy, table, strlen(table));
-	}
-	if (strlen(schema) >= NAMEDATALEN || strlen(table) >= NAMEDATALEN)
-		ereport(ERROR,
-				(errcode(ERRCODE_NAME_TOO_LONG),
-				 errmsg("target schema or table name exceeds PostgreSQL's identifier limit")));
-	relation = table_openrv(makeRangeVar(schema, table, -1),
-							RowExclusiveLock);
-	synchdb_target_validate_relation(relation);
+	relation = synchdb_bind_source_table(row->db, row->schema, row->table,
+										RowExclusiveLock);
 	bound->tableoid = RelationGetRelid(relation);
 	bound->natts = RelationGetDescr(relation)->natts;
 	keys = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_PRIMARY_KEY);
@@ -676,8 +694,6 @@ synchdb_bind_dbz_row(const SynchdbDbzRow *row, ConnectorType type)
 	bind_free_image(after);
 	bms_free(keys);
 	pfree(remote_object_id);
-	pfree(schema);
-	pfree(table);
 	/* Keep the lock while the batch applies changes, including later events. */
 	table_close(relation, NoLock);
 	return bound;

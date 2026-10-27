@@ -12,6 +12,7 @@ typedef enum SynchdbDbzEventKind
 	SYNCHDB_DBZ_EVENT_TRANSACTION,
 	SYNCHDB_DBZ_EVENT_HEARTBEAT,
 	SYNCHDB_DBZ_EVENT_LOGICAL_MESSAGE,
+	SYNCHDB_DBZ_EVENT_TRUNCATE,
 	SYNCHDB_DBZ_EVENT_UNSUPPORTED
 } SynchdbDbzEventKind;
 
@@ -33,6 +34,10 @@ typedef struct SynchdbDbzEvent
 	Jsonb *source;
 	char *connector;
 	char operation;
+	/* Exact source identity for a table-wide change, without row images. */
+	char *database;
+	char *schema;
+	char *table;
 	SynchdbDbzEventKind kind;
 	SynchdbDbzSnapshot snapshot;
 	uint64 src_ts_ms;

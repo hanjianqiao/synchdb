@@ -27,6 +27,7 @@
 #include "converter/ddl_plan.h"
 #include "converter/rule_snapshot.h"
 #include "converter/debezium_bind.h"
+#include "executor/truncate.h"
 #include "runtime/config.h"
 #include "port/pg_bswap.h"
 #ifdef WITH_OLR
@@ -84,6 +85,27 @@ apply_dbz_schema(const SynchdbDbzEvent *event, SynchdbStatistics *statistics,
  else
   increment_connector_statistics(statistics, STATS_TABLES, (int) result.tables_created);
  return result.tables_changed ? SYNCHDB_EVENT_APPLIED : SYNCHDB_EVENT_NOOP;
+}
+
+static SynchdbEventOutcome
+apply_dbz_truncate(const SynchdbDbzEvent *event, SynchdbStatistics *statistics)
+{
+	Relation relation;
+
+	if (synchdb_operation_skipped('t'))
+	{
+		elog(LOG, "skipping source TRUNCATE for %s.%s by configured operation policy",
+			 event->database, event->table);
+		return SYNCHDB_EVENT_NOOP;
+	}
+	set_shm_connector_state(myConnectorId, STATE_CONVERTING);
+	relation = synchdb_bind_source_table(event->database, event->schema,
+										event->table, AccessExclusiveLock);
+	set_shm_connector_state(myConnectorId, STATE_EXECUTING);
+	synchdb_execute_truncate(relation);
+	increment_connector_statistics(statistics, STATS_DDL, 1);
+	increment_connector_statistics(statistics, STATS_TRUNCATE, 1);
+	return SYNCHDB_EVENT_APPLIED;
 }
 
 static SynchdbEventOutcome
@@ -202,6 +224,7 @@ fc_processDBZChangeEvent(const char *json, SynchdbStatistics *statistics,
 			case SYNCHDB_DBZ_EVENT_ROW:
 			case SYNCHDB_DBZ_EVENT_SCHEMA:
 			case SYNCHDB_DBZ_EVENT_LOGICAL_MESSAGE:
+			case SYNCHDB_DBZ_EVENT_TRUNCATE:
 			{
 				ConnectorType type = fc_get_connector_type(event.connector);
 				const SynchdbRuleSnapshot *rules = synchdb_rule_snapshot_current();
@@ -217,6 +240,8 @@ fc_processDBZChangeEvent(const char *json, SynchdbStatistics *statistics,
 
 				if (event.kind == SYNCHDB_DBZ_EVENT_ROW)
 					outcome = apply_dbz_row(&event, statistics, type, snapshot);
+				else if (event.kind == SYNCHDB_DBZ_EVENT_TRUNCATE)
+					outcome = apply_dbz_truncate(&event, statistics);
 				else
 					outcome = apply_dbz_schema(&event, statistics, type, name, snapshot, first, last);
 				if (outcome == SYNCHDB_EVENT_APPLIED || outcome == SYNCHDB_EVENT_NOOP)
