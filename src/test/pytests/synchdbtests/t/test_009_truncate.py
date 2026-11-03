@@ -23,6 +23,31 @@ def _wait_rows(cursor, name, target, expected, timeout=300):
         time.sleep(0.2)
 
 
+def _wait_stats(cursor, name, expected_truncates, timeout=300):
+    """Target rows commit before the worker publishes its shared statistics."""
+    expected = (expected_truncates, 0)
+    deadline = time.monotonic() + timeout
+    while True:
+        cursor.execute("""
+            SELECT c.truncates, g.bad_events
+            FROM synchdb_cdcstats c JOIN synchdb_genstats g USING (name)
+            WHERE c.name=%s
+        """, (name,))
+        actual = cursor.fetchone()
+        cursor.execute("SELECT actual_state,last_error FROM synchdb_control_view WHERE name=%s", (name,))
+        state = cursor.fetchone()
+        detail = (f"TRUNCATE statistics for {name}: expected={expected}, "
+                  f"actual={actual}, worker={state}")
+        assert state and state[0] not in ("FAILED", "RETRY_WAIT", "STOPPED"), detail
+        if actual is not None:
+            assert actual[1] == 0, detail
+            assert 0 <= actual[0] <= expected_truncates, detail
+            if actual == expected:
+                return
+        assert time.monotonic() < deadline, f"TRUNCATE statistics did not converge: {detail}"
+        time.sleep(0.2)
+
+
 @pytest.mark.parametrize("use_spi", [False, True], ids=["tuple", "spi"])
 @pytest.mark.parametrize("skip_truncate", [False, True], ids=["apply", "skip"])
 def test_TruncateMappedTable(pg_cursor, dbvendor, use_spi, skip_truncate):
@@ -77,10 +102,7 @@ def test_TruncateMappedTable(pg_cursor, dbvendor, use_spi, skip_truncate):
             f"INSERT INTO {source_table} VALUES (2,'after')", "COMMIT"])
         expected = sorted(before + [(2, "after")]) if skip_truncate else [(2, "after")]
         _wait_rows(pg_cursor, name, target, expected)
-        pg_cursor.execute("SELECT truncates FROM synchdb_cdcstats WHERE name=%s", (name,))
-        assert pg_cursor.fetchone() == (0 if skip_truncate else 1,)
-        pg_cursor.execute("SELECT bad_events FROM synchdb_genstats WHERE name=%s", (name,))
-        assert pg_cursor.fetchone() == (0,)
+        _wait_stats(pg_cursor, name, 0 if skip_truncate else 1)
     finally:
         pg_cursor.execute("SELECT 1 FROM synchdb_conninfo WHERE name=%s", (name,))
         if pg_cursor.fetchone():
@@ -151,8 +173,7 @@ def test_TruncateFailureAndResume(pg_cursor, dbvendor, use_spi):
         # Replaying the unacknowledged truncate removes the old row. Merely
         # continuing after it would leave both rows and fail this assertion.
         _wait_rows(pg_cursor, name, target, [(2, "after")])
-        pg_cursor.execute("SELECT truncates FROM synchdb_cdcstats WHERE name=%s", (name,))
-        assert pg_cursor.fetchone() == (1,)
+        _wait_stats(pg_cursor, name, 1)
     finally:
         pg_cursor.execute("SELECT 1 FROM synchdb_conninfo WHERE name=%s", (name,))
         if pg_cursor.fetchone():
