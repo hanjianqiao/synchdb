@@ -359,13 +359,46 @@ def _fdw_snapshot_and_cdc(cursor, vendor, casing, mode):
         run_remote_query(vendor, f"CREATE TABLE {source_table} (id INTEGER NOT NULL PRIMARY KEY, note VARCHAR(20))")
         created = True
         if vendor == "sqlserver":
+            capture_instance = f"fdw_{mode}_{casing}"
             run_remote_query(vendor,
                 "EXEC sys.sp_cdc_enable_table @source_schema='dbo', "
-                f"@source_name='{source_table}', @role_name=NULL, @supports_net_changes=0")
+                f"@source_name='{source_table}', @capture_instance='{capture_instance}', "
+                "@role_name=NULL, @supports_net_changes=0")
+            # sqlcmd can return success for a server-side procedure error.
+            # Verify the capture prerequisite before starting the connector.
+            tracked = run_remote_query(vendor,
+                "SELECT is_tracked_by_cdc FROM sys.tables "
+                f"WHERE object_id=OBJECT_ID(N'dbo.{source_table}')")
+            assert len(tracked) == 1 and int(tracked[0][0]) == 1, tracked
+        elif source_upper:
+            # Minimal database logging does not retain unchanged key columns
+            # for UPDATE/DELETE. Prepare this new table just like CI's orders
+            # fixture, before writing any rows that CDC will later identify.
+            run_remote_query(vendor,
+                f"ALTER TABLE {source_table} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS")
         if source_upper and mode in ("initial", "always"):
-            # Let freshly created Oracle tables become Flashback-readable.
+            # Wait after both CREATE TABLE and supplemental-logging ALTER so
+            # Oracle's Flashback read cannot straddle the table's latest DDL.
             time.sleep(15)
         run_remote_query(vendor, f"INSERT INTO {source_table} VALUES (1,'snapshot row')")
+        if vendor == "sqlserver":
+            # Keep the source quiescent and drain SQL Server's asynchronous
+            # capture job before choosing the FDW candidate LSN. Otherwise an
+            # already copied baseline row can arrive again through CDC. This
+            # is a test prerequisite, not a production handoff-consistency fix.
+            deadline = time.monotonic() + 60
+            while True:
+                captured = run_remote_query(vendor,
+                    f"SELECT COUNT(*) FROM cdc.[{capture_instance}_CT] "
+                    "WHERE [id]=1 AND [__$operation]=2")
+                assert len(captured) == 1, captured
+                if int(captured[0][0]) >= 1:
+                    break
+                assert time.monotonic() < deadline, (
+                    "SQL Server CDC capture did not drain the fixture baseline "
+                    f"within 60 seconds: capture_instance={capture_instance}, rows={captured}"
+                )
+                time.sleep(0.2)
         operation_id = create_and_start_synchdb_connector(cursor, vendor, name, mode, srctable=selection)
         assert operation_id > 0
         result = common.get_bootstrap_result(cursor, name)
@@ -427,6 +460,19 @@ def _fdw_snapshot_and_cdc(cursor, vendor, casing, mode):
         finally:
             try:
                 if created:
+                    if vendor == "sqlserver":
+                        # DROP leaves CDC cleanup to an asynchronous job. Stop
+                        # this capture explicitly before the next case creates
+                        # the same source table under a new capture instance.
+                        run_remote_query(vendor,
+                            "IF EXISTS (SELECT 1 FROM sys.tables "
+                            f"WHERE object_id=OBJECT_ID(N'dbo.{source_table}') AND is_tracked_by_cdc=1) "
+                            "EXEC sys.sp_cdc_disable_table @source_schema='dbo', "
+                            f"@source_name='{source_table}', @capture_instance='all'")
+                        tracked = run_remote_query(vendor,
+                            "SELECT is_tracked_by_cdc FROM sys.tables "
+                            f"WHERE object_id=OBJECT_ID(N'dbo.{source_table}')")
+                        assert len(tracked) == 1 and int(tracked[0][0]) == 0, tracked
                     run_remote_query(vendor, f"DROP TABLE {source_table}")
             finally:
                 update_guc_conf(cursor, "synchdb.letter_casing_strategy", f"'{previous_casing}'", True)

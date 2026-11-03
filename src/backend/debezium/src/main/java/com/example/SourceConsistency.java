@@ -118,6 +118,16 @@ final class SourceConsistency
             throw new IllegalArgumentException("SQL Server native snapshot-to-CDC requires an unimplemented capture-drain fence; use initial_only or explicit no_data");
         properties.setProperty("snapshot.mode", mode);
 
+        if (fdwHandoff && connectorType == 3 && "recovery".equals(mode))
+        {
+            // FDW has already applied its selected data snapshot. SQL Server
+            // recovery rebuilds the captured tables' schema, without reading
+            // their data again. Do not carry the FDW data-only snapshot scope
+            // into that schema recovery; the streaming table/schema filters
+            // still define exactly which source tables are captured.
+            properties.remove("snapshot.include.collection.list");
+        }
+
         for (String key : properties.stringPropertyNames())
             if (key.startsWith("snapshot.select.statement.overrides") ||
                 key.startsWith("snapshot.mode.configuration.based.") ||
