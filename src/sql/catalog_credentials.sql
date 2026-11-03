@@ -1,4 +1,4 @@
--- Key material belongs only to the configured server keyring. These functions
+-- The built-in 1.0 key is held by the credential context. These functions
 -- are invoker APIs; table SELECT/RLS and pgcrypto ACLs continue to apply.
 CREATE OR REPLACE FUNCTION synchdb_connector_credential(pg_catalog.text,pg_catalog.text)
 RETURNS pg_catalog.text

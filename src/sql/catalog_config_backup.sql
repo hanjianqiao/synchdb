@@ -1,5 +1,5 @@
 -- Portable configuration is separate from database backup and CDC recovery.
--- This format carries caller-visible configuration and encrypted envelopes,
+-- This format carries caller-visible configuration and encrypted credentials,
 -- never grants, RLS policies, accepted execution roles, physical OIDs or offsets.
 CREATE OR REPLACE FUNCTION synchdb_export_configuration()
 RETURNS pg_catalog.jsonb

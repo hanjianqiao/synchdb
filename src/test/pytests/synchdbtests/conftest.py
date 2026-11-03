@@ -1,5 +1,4 @@
 import os
-import secrets
 import subprocess
 import time
 import shutil
@@ -125,15 +124,6 @@ class TargetInstance:
             for line in gucs:
                 f.write(f"\n{line}\n")
 
-    def configure_credentials(self):
-        # Each disposable cluster owns a fresh keyring, kept with the cluster
-        # on failure so its encrypted connector configuration remains readable.
-        key_file = os.path.abspath(os.path.join(self.temp_dir, "credentials.keyring"))
-        fd = os.open(key_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(f"synchdb-keyring-v1\nactive regression\nkey regression {secrets.token_hex(32)}\n")
-        self.write_conf(["synchdb.credential_keyfile = '" + key_file.replace("'", "''") + "'"])
-
     def start(self):
         subprocess.run(
             [self._bin("pg_ctl"), "-D", self.data_dir,
@@ -245,7 +235,6 @@ def target(pytestconfig) -> Target:
 def target_instance(request, target: Target):
     inst = TargetInstance(target)
     inst.initdb()
-    inst.configure_credentials()
     inst.write_conf(_BASE_GUCS + target.extra_conf)
     inst.start()
     try:

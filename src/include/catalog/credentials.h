@@ -1,4 +1,4 @@
-/* Versioned connector credentials backed by a server-owned keyring file. */
+/* Connector credentials initialized with the 1.0-compatible built-in key. */
 #ifndef SYNCHDB_CREDENTIALS_H
 #define SYNCHDB_CREDENTIALS_H
 
@@ -6,13 +6,12 @@
 
 typedef struct SynchdbCredentials SynchdbCredentials;
 
-extern void synchdb_credentials_register_guc(void);
-/* A context pins one complete keyring, including its active key, per operation. */
+/* A context owns one key collection, including its active key, per operation. */
 extern SynchdbCredentials *synchdb_credentials_open(void);
 extern void synchdb_credentials_close(SynchdbCredentials *credentials);
 extern Jsonb *synchdb_credentials_encrypt(SynchdbCredentials *credentials,
 										 const char *plaintext);
 extern char *synchdb_credentials_decrypt(SynchdbCredentials *credentials,
-										 Jsonb *envelope);
+										 Jsonb *stored);
 
 #endif

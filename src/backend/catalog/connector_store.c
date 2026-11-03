@@ -522,7 +522,7 @@ connector_store_boolean_field(const char *key, bool value)
 
 /*
  * Each public writer supplies its fixed field list.  Keys, values, connector
- * name are all SPI parameters. Secrets become versioned encrypted envelopes
+ * name are all SPI parameters. Secrets become 1.0-compatible encrypted strings
  * before binding, and key material never enters SQL. No SQL/data fragment is
  * accepted from a caller, and this helper never owns the caller's transaction.
  */
@@ -550,7 +550,7 @@ connector_store_write_fields(const char *name, const ConnectorStoreField *fields
 	synchdb_store_connect();
 	relation = synchdb_store_relation(SYNCHDB_CONNINFO_TABLE, RowExclusiveLock);
 	if (encrypted)
-		/* Lock before pinning a keyring, as the re-encryption operation does. */
+		/* Keep the same lock order as the re-encryption operation. */
 		credentials = synchdb_credentials_open();
 	argtypes = palloc(nargs * sizeof(Oid));
 	values = palloc0(nargs * sizeof(Datum));

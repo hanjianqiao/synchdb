@@ -1,13 +1,9 @@
 /*
- * Versioned credentials.  The keyring is deliberately not stored in SQL or
- * cached across operations: atomic replacement changes the active key while
- * keys retained in the file continue to decode existing field envelopes.
+ * Connector credentials retain their per-operation key collection and cleanup,
+ * initialized in code with the 1.0 passphrase.  Write the 1.0 bytea JSON string
+ * format as well, so both versions can read credentials written by the other.
  */
 #include "postgres.h"
-
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 #include "catalog/catalog_access.h"
 #include "catalog/credentials.h"
@@ -20,25 +16,25 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "parser/parse_func.h"
-#include "storage/fd.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
-#include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/numeric.h"
 #include "utils/uuid.h"
 
-#define CREDENTIAL_KEYFILE_LIMIT (16 * 1024)
 #define CREDENTIAL_KEY_LIMIT 64
 #define CREDENTIAL_KEY_ID_LIMIT 63
-#define CREDENTIAL_KEY_HEX_LENGTH 64
+#define CREDENTIAL_KEY_SECRET_LIMIT 64
 #define CREDENTIAL_CIPHERTEXT_LIMIT (512 * 1024)
+
+/* The 1.0 SYNCHDB_SECRET, used verbatim as a text passphrase, not hex bytes. */
+#define CREDENTIAL_LEGACY_SECRET "930e62fb8c40086c23f543357a023c0c"
 
 typedef struct CredentialKey
 {
 	char id[CREDENTIAL_KEY_ID_LIMIT + 1];
-	char secret[CREDENTIAL_KEY_HEX_LENGTH + 1];
+	char secret[CREDENTIAL_KEY_SECRET_LIMIT + 1];
 } CredentialKey;
 
 struct SynchdbCredentials
@@ -50,10 +46,8 @@ struct SynchdbCredentials
 	int count;
 	int active;
 	CredentialKey keys[CREDENTIAL_KEY_LIMIT];
-	char file_buffer[CREDENTIAL_KEYFILE_LIMIT + 1];
 };
 
-static char *credential_keyfile;
 static const char *const credential_fields[] = {
 	"pwd", "ssl_keystore_pass", "ssl_truststore_pass",
 	"jmx_ssl_keystore_pass", "jmx_ssl_truststore_pass", "fdw_ssl_cipher"
@@ -62,48 +56,12 @@ static const char *const credential_fields[] = {
 PG_FUNCTION_INFO_V1(synchdb_connector_credential);
 PG_FUNCTION_INFO_V1(synchdb_reencrypt_credentials);
 
-void
-synchdb_credentials_register_guc(void)
-{
-	DefineCustomStringVariable("synchdb.credential_keyfile",
-							   "Absolute path to a server-owned connector credential keyring.",
-							   NULL, &credential_keyfile, "", PGC_SIGHUP,
-							   GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
-}
-
 static void
 credential_cleanup(void *argument)
 {
 	SynchdbCredentials *credentials = argument;
 
 	explicit_bzero(credentials->keys, sizeof(credentials->keys));
-	explicit_bzero(credentials->file_buffer, sizeof(credentials->file_buffer));
-}
-
-static void
-credential_file_invalid(void)
-{
-	ereport(ERROR,
-			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			 errmsg("invalid connector credential keyring"),
-			 errhint("Use a version 1 keyring with one active key and distinct key identifiers.")));
-}
-
-static bool
-credential_id_valid(const char *id)
-{
-	Size length = strlen(id);
-	Size i;
-
-	if (length == 0 || length > CREDENTIAL_KEY_ID_LIMIT)
-		return false;
-	for (i = 0; i < length; i++)
-		if (!((id[i] >= 'a' && id[i] <= 'z') ||
-			  (id[i] >= 'A' && id[i] <= 'Z') ||
-			  (id[i] >= '0' && id[i] <= '9') ||
-			  id[i] == '_' || id[i] == '-'))
-			return false;
-	return true;
 }
 
 static bool
@@ -119,123 +77,13 @@ credential_hex_valid(const char *value, Size length)
 }
 
 static void
-credential_read_keyring(SynchdbCredentials *credentials)
+credential_initialize(SynchdbCredentials *credentials)
 {
-	struct stat before;
-	struct stat after;
-	int descriptor;
-	Size length = 0;
-	char active[CREDENTIAL_KEY_ID_LIMIT + 1] = {0};
-	char *line;
-	char *next;
-	char *end;
-	bool header = false;
-	int i;
-
-	if (!credential_keyfile || !is_absolute_path(credential_keyfile))
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("connector credential keyring is not configured"),
-				 errhint("Set synchdb.credential_keyfile to an absolute server-owned keyring path and reload configuration.")));
-	descriptor = OpenTransientFile(credential_keyfile,
-								 O_RDONLY | PG_BINARY | O_NOFOLLOW | O_NONBLOCK);
-	if (descriptor < 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not open connector credential keyring: %m")));
-	if (fstat(descriptor, &before) != 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not inspect connector credential keyring: %m")));
-	if (!S_ISREG(before.st_mode) || before.st_uid != geteuid() ||
-		(before.st_mode & 07777) != 0600 || before.st_size <= 0 ||
-		before.st_size > CREDENTIAL_KEYFILE_LIMIT)
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("connector credential keyring must be a server-owned regular file with mode 0600 and at most 16 KiB")));
-	while (length < (Size) before.st_size)
-	{
-		ssize_t count;
-
-		CHECK_FOR_INTERRUPTS();
-		count = read(descriptor, credentials->file_buffer + length,
-					 (Size) before.st_size - length);
-		if (count < 0 && errno == EINTR)
-			continue;
-		if (count <= 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_IO_ERROR),
-					 errmsg("could not read complete connector credential keyring")));
-		length += count;
-	}
-	if (fstat(descriptor, &after) != 0 ||
-		before.st_size != after.st_size || before.st_mode != after.st_mode ||
-		before.st_uid != after.st_uid || before.st_mtime != after.st_mtime ||
-		before.st_ctime != after.st_ctime)
-		ereport(ERROR,
-				(errcode(ERRCODE_IO_ERROR),
-				 errmsg("connector credential keyring changed while being read")));
-	if (CloseTransientFile(descriptor) != 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not close connector credential keyring: %m")));
-	if (memchr(credentials->file_buffer, '\0', length) != NULL)
-		credential_file_invalid();
-	credentials->file_buffer[length] = '\0';
-	line = credentials->file_buffer;
-	end = line + length;
-	while (line < end)
-	{
-		next = memchr(line, '\n', end - line);
-		if (next)
-			*next++ = '\0';
-		else
-			next = end;
-		if (line[0] == '\0')
-			credential_file_invalid();
-		if (!header)
-		{
-			if (strcmp(line, "synchdb-keyring-v1") != 0)
-				credential_file_invalid();
-			header = true;
-		}
-		else if (strncmp(line, "active ", 7) == 0)
-		{
-			if (active[0] || !credential_id_valid(line + 7))
-				credential_file_invalid();
-			strlcpy(active, line + 7, sizeof(active));
-		}
-		else if (strncmp(line, "key ", 4) == 0)
-		{
-			char *secret = strchr(line + 4, ' ');
-			CredentialKey *key;
-
-			if (!secret || credentials->count == CREDENTIAL_KEY_LIMIT)
-				credential_file_invalid();
-			*secret++ = '\0';
-			if (!credential_id_valid(line + 4) ||
-				strlen(secret) != CREDENTIAL_KEY_HEX_LENGTH ||
-				!credential_hex_valid(secret, CREDENTIAL_KEY_HEX_LENGTH))
-				credential_file_invalid();
-			for (i = 0; i < credentials->count; i++)
-				if (strcmp(credentials->keys[i].id, line + 4) == 0 ||
-					strcmp(credentials->keys[i].secret, secret) == 0)
-					credential_file_invalid();
-			key = &credentials->keys[credentials->count++];
-			strlcpy(key->id, line + 4, sizeof(key->id));
-			strlcpy(key->secret, secret, sizeof(key->secret));
-		}
-		else
-			credential_file_invalid();
-		line = next;
-	}
-	credentials->active = -1;
-	for (i = 0; i < credentials->count; i++)
-		if (strcmp(credentials->keys[i].id, active) == 0)
-			credentials->active = i;
-	if (!header || credentials->active < 0)
-		credential_file_invalid();
-	explicit_bzero(credentials->file_buffer, sizeof(credentials->file_buffer));
+	credentials->count = 1;
+	credentials->active = 0;
+	strlcpy(credentials->keys[0].id, "legacy", sizeof(credentials->keys[0].id));
+	strlcpy(credentials->keys[0].secret, CREDENTIAL_LEGACY_SECRET,
+			sizeof(credentials->keys[0].secret));
 }
 
 static Oid
@@ -267,7 +115,7 @@ SynchdbCredentials *
 synchdb_credentials_open(void)
 {
 	MemoryContext context = AllocSetContextCreate(CurrentMemoryContext,
-												 "SynchDB credential keyring",
+												 "SynchDB credentials",
 												 ALLOCSET_SMALL_SIZES);
 	MemoryContext prior = MemoryContextSwitchTo(context);
 	SynchdbCredentials *credentials = palloc0(sizeof(*credentials));
@@ -276,7 +124,7 @@ synchdb_credentials_open(void)
 	credentials->cleanup.func = credential_cleanup;
 	credentials->cleanup.arg = credentials;
 	MemoryContextRegisterResetCallback(context, &credentials->cleanup);
-	credential_read_keyring(credentials);
+	credential_initialize(credentials);
 	MemoryContextSwitchTo(prior);
 	return credentials;
 }
@@ -297,17 +145,6 @@ credential_json_key(JsonbParseState **state, const char *key)
 	value.val.string.val = (char *) key;
 	value.val.string.len = strlen(key);
 	pushJsonbValue(state, WJB_KEY, &value);
-}
-
-static void
-credential_json_string(JsonbParseState **state, const char *string)
-{
-	JsonbValue value;
-
-	value.type = jbvString;
-	value.val.string.val = (char *) string;
-	value.val.string.len = strlen(string);
-	pushJsonbValue(state, WJB_VALUE, &value);
 }
 
 /* Direct fmgr calls keep passphrases out of SPI SQL parameters and contexts. */
@@ -335,12 +172,12 @@ credential_crypto_call(Oid function_oid, Datum input, CredentialKey *key)
 Jsonb *
 synchdb_credentials_encrypt(SynchdbCredentials *credentials, const char *plaintext)
 {
-	JsonbParseState *state = NULL;
 	JsonbValue value;
+	Jsonb *result;
 	CredentialKey *key = &credentials->keys[credentials->active];
 	text *input;
 	bytea *encrypted = NULL;
-	char *hex;
+	char *encoded;
 
 	if (!OidIsValid(credentials->encrypt_oid))
 		credentials->encrypt_oid = credential_crypto_function("pgp_sym_encrypt", TEXTOID);
@@ -358,19 +195,16 @@ synchdb_credentials_encrypt(SynchdbCredentials *credentials, const char *plainte
 	PG_END_TRY();
 	explicit_bzero(VARDATA(input), VARSIZE(input) - VARHDRSZ);
 	pfree(input);
-	hex = palloc(2 * (VARSIZE_ANY_EXHDR(encrypted)) + 1);
-	hex_encode(VARDATA_ANY(encrypted), VARSIZE_ANY_EXHDR(encrypted), hex);
-	hex[2 * VARSIZE_ANY_EXHDR(encrypted)] = '\0';
-	pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
-	credential_json_key(&state, "version");
-	value.type = jbvNumeric;
-	value.val.numeric = int64_to_numeric(1);
-	pushJsonbValue(&state, WJB_VALUE, &value);
-	credential_json_key(&state, "key_id");
-	credential_json_string(&state, key->id);
-	credential_json_key(&state, "ciphertext");
-	credential_json_string(&state, hex);
-	return JsonbValueToJsonb(pushJsonbValue(&state, WJB_END_OBJECT, NULL));
+	/* Match jsonb_build_object(..., pgp_sym_encrypt(...)) in 1.0, including
+	 * bytea_output=escape.  PGP ciphertext itself is randomized. */
+	encoded = DatumGetCString(DirectFunctionCall1(byteaout, PointerGetDatum(encrypted)));
+	value.type = jbvString;
+	value.val.string.val = encoded;
+	value.val.string.len = strlen(encoded);
+	result = JsonbValueToJsonb(&value);
+	pfree(encoded);
+	pfree(encrypted);
+	return result;
 }
 
 static JsonbValue *
@@ -384,16 +218,15 @@ credential_json_member(Jsonb *envelope, const char *name)
 	return findJsonbValueFromContainer(&envelope->root, JB_FOBJECT, &key);
 }
 
-char *
-synchdb_credentials_decrypt(SynchdbCredentials *credentials, Jsonb *envelope)
+/* Retain the v1 reader for envelopes using a key in the current collection. */
+static bytea *
+credential_decode_envelope(SynchdbCredentials *credentials, Jsonb *envelope,
+						   CredentialKey **key)
 {
 	JsonbValue *version;
 	JsonbValue *key_id;
 	JsonbValue *ciphertext;
-	CredentialKey *key = NULL;
 	bytea *encrypted;
-	text *decrypted;
-	char *result;
 	int i;
 
 	if (!JB_ROOT_IS_OBJECT(envelope) || JB_ROOT_COUNT(envelope) != 3)
@@ -420,21 +253,54 @@ synchdb_credentials_decrypt(SynchdbCredentials *credentials, Jsonb *envelope)
 		if ((Size) key_id->val.string.len == strlen(credentials->keys[i].id) &&
 			memcmp(key_id->val.string.val, credentials->keys[i].id,
 				   key_id->val.string.len) == 0)
-			key = &credentials->keys[i];
-	if (!key)
+			*key = &credentials->keys[i];
+	if (!*key)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("connector credential requires a key absent from the configured keyring")));
-	if (!OidIsValid(credentials->decrypt_oid))
-		credentials->decrypt_oid = credential_crypto_function("pgp_sym_decrypt", BYTEAOID);
+				 errmsg("connector credential requires an unavailable key"),
+				 errhint("Re-enter credentials previously encrypted with an external key.")));
 	encrypted = palloc(VARHDRSZ + ciphertext->val.string.len / 2);
 	SET_VARSIZE(encrypted, VARHDRSZ + ciphertext->val.string.len / 2);
 	hex_decode(ciphertext->val.string.val, ciphertext->val.string.len, VARDATA(encrypted));
+	return encrypted;
+}
+
+char *
+synchdb_credentials_decrypt(SynchdbCredentials *credentials, Jsonb *stored)
+{
+	CredentialKey *key = NULL;
+	bytea *encrypted;
+	text *decrypted;
+	char *result;
+
+	if (JB_ROOT_IS_SCALAR(stored))
+	{
+		JsonbValue scalar;
+		char *encoded;
+
+		JsonbExtractScalar(&stored->root, &scalar);
+		if (scalar.type != jbvString || scalar.val.string.len == 0 ||
+			scalar.val.string.len > CREDENTIAL_CIPHERTEXT_LIMIT)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid connector credential ciphertext")));
+		/* The 1.0 reader casts data->>'field' to bytea.  byteain accepts
+		 * both hex and escape output without treating plaintext as a secret. */
+		encoded = pnstrdup(scalar.val.string.val, scalar.val.string.len);
+		encrypted = DatumGetByteaP(DirectFunctionCall1(byteain, CStringGetDatum(encoded)));
+		pfree(encoded);
+		key = &credentials->keys[credentials->active];
+	}
+	else
+		encrypted = credential_decode_envelope(credentials, stored, &key);
+	if (!OidIsValid(credentials->decrypt_oid))
+		credentials->decrypt_oid = credential_crypto_function("pgp_sym_decrypt", BYTEAOID);
 	decrypted = DatumGetTextP(credential_crypto_call(credentials->decrypt_oid,
 													 PointerGetDatum(encrypted), key));
 	result = text_to_cstring(decrypted);
 	explicit_bzero(VARDATA_ANY(decrypted), VARSIZE_ANY_EXHDR(decrypted));
 	pfree(decrypted);
+	pfree(encrypted);
 	return result;
 }
 
@@ -453,6 +319,7 @@ synchdb_connector_credential(PG_FUNCTION_ARGS)
 	char *plaintext;
 	text *result;
 	bool isnull;
+	bool absent;
 	bool allowed = false;
 	int i;
 
@@ -474,18 +341,17 @@ synchdb_connector_credential(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("connector credential requires exactly one connector")));
 	value = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
-	if (isnull || JB_ROOT_IS_SCALAR(DatumGetJsonbP(value)))
+	absent = isnull;
+	if (!isnull && JB_ROOT_IS_SCALAR(DatumGetJsonbP(value)))
 	{
-		/* SQL NULL/missing and the JSON null optional-field representation. */
-		if (!isnull)
-		{
-			JsonbValue scalar;
+		JsonbValue scalar;
 
-			JsonbExtractScalar(&DatumGetJsonbP(value)->root, &scalar);
-			if (scalar.type != jbvNull)
-				ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							 errmsg("invalid connector credential envelope")));
-		}
+		JsonbExtractScalar(&DatumGetJsonbP(value)->root, &scalar);
+		absent = scalar.type == jbvNull;
+	}
+	/* SQL NULL/missing and the JSON null optional-field representation. */
+	if (absent)
+	{
 		synchdb_store_finish();
 		PG_RETURN_NULL();
 	}

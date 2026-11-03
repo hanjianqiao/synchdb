@@ -2643,7 +2643,6 @@ check_connector_capacity(int *value, void **extra, GucSource source)
 void
 _PG_init(void)
 {
-	synchdb_credentials_register_guc();
 	DefineCustomIntVariable("synchdb.naptime",
 							"Duration between each data polling (in milliseconds).",
 							NULL,

@@ -307,7 +307,7 @@ EXCEPTION
         RAISE EXCEPTION 'synchdb_prepare_initial_snapshot(%) failed: % [%]',
                         p_connector_name, SQLERRM, SQLSTATE
         USING ERRCODE = SQLSTATE,
-              HINT = 'Verify designated FDWs, connector fields, credential keyring, and caller privileges.';
+              HINT = 'Verify designated FDWs, connector fields, credentials, and caller privileges.';
 END;
 $$;
 
