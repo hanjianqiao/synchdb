@@ -153,14 +153,16 @@ synchdb_bootstrap_value(PG_FUNCTION_ARGS)
 void
 synchdb_bootstrap_require_mode(const char *mode, bool schema_only)
 {
-	if (schema_only || (mode && pg_strcasecmp(mode, "initial_only") == 0))
+	if (schema_only || (mode &&
+		(pg_strcasecmp(mode, "initial_only") == 0 ||
+		 pg_strcasecmp(mode, "initial") == 0 ||
+		 pg_strcasecmp(mode, "always") == 0 ||
+		 pg_strcasecmp(mode, "no_data") == 0 ||
+		 pg_strcasecmp(mode, "never") == 0)))
 		return;
-	/* A source read position alone is not an engine resume boundary. */
 	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("FDW bootstrap cannot establish a verified CDC handoff for mode %s",
-					mode ? mode : "NULL"),
-			 errhint("Use initial_only or schemasync; CDC handoff requires a provider-specific protocol.")));
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("unsupported FDW bootstrap mode: %s", mode ? mode : "NULL")));
 }
 
 static JsonbValue *
@@ -214,12 +216,33 @@ synchdb_bootstrap_parse_result(Jsonb *json, MemoryContext context)
 		elog(ERROR, "unknown bootstrap result status");
 	bootstrap_member(&json->root, "after_bootstrap", jbvString, &value);
 	result->stop_after = bootstrap_string_is(&value, "STOP");
-	if (!result->stop_after && !bootstrap_string_is(&value, "PAUSE"))
+	result->continue_cdc = bootstrap_string_is(&value, "CDC");
+	if (!result->stop_after && !result->continue_cdc && !bootstrap_string_is(&value, "PAUSE"))
 		elog(ERROR, "unsupported bootstrap continuation");
 	bootstrap_member(&json->root, "cdc_eligible", jbvBool, &value);
-	if (value.val.boolean)
-		elog(ERROR, "FDW bootstrap unexpectedly advertised CDC eligibility");
-	bootstrap_member(&json->root, "cdc_resume_material", jbvNull, &value);
+	result->cdc_eligible = value.val.boolean;
+	if (result->cdc_eligible)
+	{
+		JsonbValue offset;
+		JsonbValue history;
+
+		/* TODO: these are runnable legacy coordinates, not proof that the
+		 * FDW read view and the CDC stream share a consistent boundary. */
+		bootstrap_member(&json->root, "cdc_resume_material", jbvBinary, &value);
+		if (!JsonContainerIsObject(value.val.binary.data))
+			elog(ERROR, "bootstrap CDC resume material must be an object");
+		bootstrap_member(value.val.binary.data, "offset", jbvBinary, &offset);
+		bootstrap_member(value.val.binary.data, "history", jbvBinary, &history);
+		if (!JsonContainerIsObject(offset.val.binary.data) ||
+			!JsonContainerIsArray(history.val.binary.data) || result->stop_after ||
+			result->status != SYNCHDB_BOOTSTRAP_COMPLETE)
+			elog(ERROR, "invalid bootstrap CDC continuation");
+		caller = MemoryContextSwitchTo(context);
+		result->resume_material = JsonbValueToJsonb(&value);
+		MemoryContextSwitchTo(caller);
+	}
+	else
+		bootstrap_member(&json->root, "cdc_resume_material", jbvNull, &value);
 	bootstrap_member(&json->root, "tables", jbvBinary, &tables);
 	if (!JsonContainerIsArray(tables.val.binary.data))
 		elog(ERROR, "bootstrap tables must be an array");
@@ -281,7 +304,7 @@ synchdb_bootstrap_execute(const SynchdbRunSpec *spec, MemoryContext context)
 	appendStringInfoString(&request, "{\"version\":1,\"connector_name\":");
 	escape_json(&request, connection->name);
 	appendStringInfoString(&request, ",\"mode\":");
-	escape_json(&request, schema_only ? "schemasync" : "initial_only");
+	escape_json(&request, schema_only ? "schemasync" : spec->snapshot_mode);
 	appendStringInfoString(&request, ",\"dest_schema\":");
 	escape_json(&request, destination);
 	appendStringInfoString(&request, ",\"connector_id\":");
@@ -311,7 +334,9 @@ synchdb_bootstrap_execute(const SynchdbRunSpec *spec, MemoryContext context)
 	if (is_null)
 		elog(ERROR, "bootstrap returned NULL");
 	result = synchdb_bootstrap_parse_result(DatumGetJsonbP(json), context);
-	if (result->stop_after != !schema_only)
+	if (result->stop_after != (!schema_only && pg_strcasecmp(spec->snapshot_mode, "initial_only") == 0) ||
+		result->continue_cdc != (!schema_only &&
+		 (pg_strcasecmp(spec->snapshot_mode, "initial") == 0 || pg_strcasecmp(spec->snapshot_mode, "always") == 0)))
 		elog(ERROR, "bootstrap continuation disagrees with the request");
 	if (SPI_finish() != SPI_OK_FINISH)
 		elog(ERROR, "could not finish SPI bootstrap");

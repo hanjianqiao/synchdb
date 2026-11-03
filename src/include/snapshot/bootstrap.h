@@ -1,4 +1,4 @@
-/* Local FDW bootstrap coordination; CDC handoff is a separate capability. */
+/* Local FDW bootstrap and the legacy, unverified CDC continuation. */
 #ifndef SYNCHDB_BOOTSTRAP_H
 #define SYNCHDB_BOOTSTRAP_H
 
@@ -16,6 +16,9 @@ typedef struct SynchdbBootstrapResult
 {
 	SynchdbBootstrapStatus status;
 	bool stop_after;
+	bool continue_cdc;
+	bool cdc_eligible;
+	Jsonb *resume_material;
 	uint64 completed_tables;
 	uint64 failed_tables;
 	Jsonb *detail;

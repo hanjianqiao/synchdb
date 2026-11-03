@@ -7,6 +7,8 @@
 
 extern bool olr_handoff_prepare(const ConnectionInfo *connection, SynchdbJavaRuntime *java);
 extern void olr_handoff_complete(const ConnectionInfo *connection, SynchdbJavaRuntime *java);
+/* FDW compatibility boundary; no native snapshot/read-view proof is claimed. */
+extern void olr_handoff_complete_fdw(const ConnectionInfo *connection, Jsonb *material);
 extern void olr_handoff_reconnect(const ConnectionInfo *connection, SynchdbJavaRuntime *java);
 extern bool olr_handoff_active(void);
 /* Caller owns the same transaction as the applied source rows. */

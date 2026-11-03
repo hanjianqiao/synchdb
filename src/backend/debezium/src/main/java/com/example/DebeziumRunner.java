@@ -41,6 +41,18 @@ public class DebeziumRunner {
 		return OlrHandoff.prepare(request);
 	}
 
+	public String prepareFdwSource(String request) throws Exception
+	{
+		return FdwHandoff.prepareSource(request);
+	}
+
+	public String publishFdwHandoff(String request) throws Exception
+	{
+		String result = FdwHandoff.publish(request);
+		activeArtifactBase = new ObjectMapper().readTree(request).required("artifact_base").asText();
+		return result;
+	}
+
 	private int allocateBatchId()
 	{
 		long id = nextBatchId.getAndUpdate(value -> value <= Integer.MAX_VALUE ? value + 1 : value);
@@ -114,6 +126,7 @@ public class DebeziumRunner {
 		private String artifactBase;
 		private boolean artifactResume;
 		private boolean artifactResumeConfigured;
+		private boolean artifactFdwHandoff;
 		private String postgresLegacySlot;
 		private String postgresLegacyPublication;
 
@@ -145,6 +158,11 @@ public class DebeziumRunner {
 		{
 			this.artifactResume = resumeExisting;
 			this.artifactResumeConfigured = true;
+			return this;
+		}
+		public MyParameters setArtifactFdwHandoff(boolean fdwHandoff)
+		{
+			this.artifactFdwHandoff = fdwHandoff;
 			return this;
 		}
 		public MyParameters setPostgresLegacyIdentity(String slot, String publication)
@@ -370,8 +388,13 @@ public class DebeziumRunner {
 		activeArtifactBase = myParameters.artifactBase;
 		OffsetStore.requireResumePartition(myParameters.connectorType == TYPE_OPENLOG_REPLICATOR ? TYPE_ORACLE : myParameters.connectorType,
 			myParameters.database, java.nio.file.Path.of(activeArtifactBase + "_offsets.dat"));
-		ArtifactFiles.validateHistory(myParameters.connectorType, java.nio.file.Path.of(activeArtifactBase + "_schemahistory.dat"),
-			myParameters.artifactResume);
+		// SQL Server compatibility seeds rebuild their connector-specific history
+		// in recovery mode. An ordinary resume still requires its existing file.
+		boolean fdwRecovery = myParameters.artifactFdwHandoff && myParameters.connectorType == TYPE_SQLSERVER
+			&& "recovery".equals(myParameters.snapshotMode);
+		if (!fdwRecovery || java.nio.file.Files.exists(java.nio.file.Path.of(activeArtifactBase + "_schemahistory.dat")))
+			ArtifactFiles.validateHistory(myParameters.connectorType, java.nio.file.Path.of(activeArtifactBase + "_schemahistory.dat"),
+				myParameters.artifactResume);
 
 		final BatchBridge batches = new BatchBridge(this::allocateBatchId);
 		final EngineSession next = new EngineSession(batches);
@@ -762,7 +785,7 @@ public class DebeziumRunner {
 			if (myParameters.cdcDelay > 0)
 				props.setProperty("streaming.delay.ms", String.valueOf(myParameters.cdcDelay));
 
-			SourceConsistency.configure(props, myParameters.connectorType);
+			SourceConsistency.configure(props, myParameters.connectorType, myParameters.artifactFdwHandoff);
 			NativeSourcePreflight.requireArtifactState(props, myParameters.artifactResume);
 			if (myParameters.connectorType == TYPE_POSTGRES)
 				NativeSourcePreflight.validatePostgres(props, myParameters.artifactResume);

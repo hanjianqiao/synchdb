@@ -4,8 +4,11 @@
 #include "runtime/java_jni.h"
 #include "runtime/java_operations.h"
 #include "runtime/worker_runtime.h"
+#include "lib/stringinfo.h"
 #include "snapshot/artifact_store.h"
 #include "synchdb/synchdb.h"
+#include "utils/json.h"
+#include "utils/memutils.h"
 
 #define PARAMETERS_RESULT "Lcom/example/DebeziumRunner$MyParameters;"
 
@@ -21,20 +24,20 @@ synchdb_java_string_operation(SynchdbJavaRuntime *java, const char *name,
 	char *volatile result = NULL;
 
 	if (!env || !java->runner_bound || !synchdb_java_local_begin(env, 4))
-		elog(ERROR, "OLR preflight requires a bound Java runtime");
+		elog(ERROR, "source preflight requires a bound Java runtime");
 	PG_TRY();
 	{
 		method = (*env)->GetMethodID(env, java->cls, name,
 			"(Ljava/lang/String;)Ljava/lang/String;");
 		if (synchdb_java_exception(env) || !method)
-			elog(ERROR, "OLR Java method %s is unavailable", name);
+			elog(ERROR, "source Java method %s is unavailable", name);
 		argument = synchdb_java_string(env, request);
 		returned = (jstring) (*env)->CallObjectMethod(env, java->obj, method, argument);
 		if (synchdb_java_exception(env) || !returned)
-			elog(ERROR, "OLR Java operation %s failed; inspect the source preflight error", name);
+			elog(ERROR, "source Java operation %s failed; inspect the source preflight error", name);
 		utf = (*env)->GetStringUTFChars(env, returned, NULL);
 		if (synchdb_java_exception(env) || !utf)
-			elog(ERROR, "could not read OLR Java operation result");
+			elog(ERROR, "could not read source Java operation result");
 		result = pstrdup(utf);
 	}
 	PG_FINALLY();
@@ -134,11 +137,13 @@ java_set_artifact_parameters(JNIEnv *env, jclass cls, jobject parameters,
 							const SynchdbArtifactPaths *artifacts)
 {
 	jvalue resume = {.z = artifacts->resume_existing ? JNI_TRUE : JNI_FALSE};
+	jvalue fdw = {.z = artifacts->fdw_seed ? JNI_TRUE : JNI_FALSE};
 	jvalue legacy[2] = {0};
 	bool result;
 
 	if (!java_set_string(env, cls, parameters, "setArtifactBase", artifacts->base) ||
-		!java_set_parameter(env, cls, parameters, "setArtifactResume", "(Z)" PARAMETERS_RESULT, &resume))
+		!java_set_parameter(env, cls, parameters, "setArtifactResume", "(Z)" PARAMETERS_RESULT, &resume) ||
+		!java_set_parameter(env, cls, parameters, "setArtifactFdwHandoff", "(Z)" PARAMETERS_RESULT, &fdw))
 		return false;
 	if (artifacts->postgres_legacy_slot[0] == '\0')
 		return true;
@@ -249,6 +254,96 @@ java_prepare_artifacts(const ConnectionInfo *connection, int connector_type,
 		synchdb_worker_sql_restore(previous);
 	}
 	PG_END_TRY();
+}
+
+static void
+fdw_request_string(StringInfo request, const char *key, const char *value)
+{
+	appendStringInfoChar(request, ',');
+	escape_json(request, key);
+	appendStringInfoChar(request, ':');
+	escape_json(request, value);
+}
+
+void
+synchdb_java_prepare_fdw_source(SynchdbJavaRuntime *java,
+							   const ConnectionInfo *connection, int connector_type)
+{
+	SynchdbArtifactPaths *artifacts;
+	StringInfoData request;
+	bool previous = synchdb_worker_sql_interruptible();
+	char *response;
+
+	if (!java_operation_live(java) || java->prepared_artifacts || java->engine_start_attempted)
+		elog(ERROR, "FDW source preparation requires a fresh bound Java runtime");
+	artifacts = MemoryContextAllocZero(TopMemoryContext, sizeof(*artifacts));
+	PG_TRY();
+	{
+		synchdb_worker_sql_enter();
+		synchdb_artifact_store_prepare_fdw(connection, connector_type, artifacts);
+	}
+	PG_FINALLY();
+	{
+		synchdb_worker_sql_restore(previous);
+	}
+	PG_END_TRY();
+	java->prepared_artifacts = artifacts;
+	if (connector_type != TYPE_POSTGRES)
+		return;
+	/* Retain WAL before the FDW candidate LSN is read. TODO: import the slot's
+	 * read snapshot into the FDW transaction; this does not close that gap. */
+	initStringInfo(&request);
+	appendStringInfo(&request, "{\"connector_type\":%d,\"port\":%u", connector_type, connection->port);
+	fdw_request_string(&request, "artifact_base", artifacts->base);
+	fdw_request_string(&request, "hostname", connection->hostname);
+	fdw_request_string(&request, "user", connection->user);
+	fdw_request_string(&request, "password", connection->pwd);
+	fdw_request_string(&request, "database", connection->srcdb);
+	fdw_request_string(&request, "schema", connection->srcschema);
+	fdw_request_string(&request, "table", strncmp(connection->table, "file:", 5) == 0 ?
+		psprintf("file:%s", artifacts->table_filter) : connection->table);
+	fdw_request_string(&request, "ssl_mode", connection->extra.ssl_mode);
+	fdw_request_string(&request, "ssl_keystore", connection->extra.ssl_keystore);
+	fdw_request_string(&request, "ssl_keystore_pass", connection->extra.ssl_keystore_pass);
+	fdw_request_string(&request, "ssl_truststore", connection->extra.ssl_truststore);
+	fdw_request_string(&request, "ssl_truststore_pass", connection->extra.ssl_truststore_pass);
+	appendStringInfoChar(&request, '}');
+	PG_TRY();
+	{
+		response = synchdb_java_string_operation(java, "prepareFdwSource", request.data);
+	}
+	PG_FINALLY();
+	{
+		explicit_bzero(request.data, request.len);
+		pfree(request.data);
+	}
+	PG_END_TRY();
+	pfree(response);
+}
+
+void
+synchdb_java_prepare_fdw_handoff(SynchdbJavaRuntime *java,
+		const ConnectionInfo *connection, int connector_type, Jsonb *material)
+{
+	StringInfoData request;
+	SynchdbArtifactPaths *artifacts = java->prepared_artifacts;
+	char *response;
+
+	if (!java_operation_live(java) || !artifacts || !artifacts->fdw_seed ||
+		artifacts->resume_existing || java->engine_start_attempted || material == NULL)
+		elog(ERROR, "FDW handoff requires a fresh owned artifact generation and completed bootstrap material");
+	initStringInfo(&request);
+	appendStringInfo(&request, "{\"connector_type\":%d", connector_type);
+	fdw_request_string(&request, "artifact_base", artifacts->base);
+	fdw_request_string(&request, "database", connection->srcdb);
+	appendStringInfoString(&request, ",\"material\":");
+	(void) JsonbToCString(&request, &material->root, VARSIZE(material));
+	appendStringInfoChar(&request, '}');
+	response = synchdb_java_string_operation(java, "publishFdwHandoff", request.data);
+	pfree(response);
+	pfree(request.data);
+	/* Subsequent starts use the owned engine files, never reapply this seed. */
+	artifacts->resume_existing = true;
 }
 
 int

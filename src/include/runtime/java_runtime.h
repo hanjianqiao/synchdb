@@ -50,7 +50,7 @@ typedef struct SynchdbJavaRuntime
 	bool stop_requested;
 	bool stop_confirmed;
 	bool stop_failed;
-	/* OLR claims its generation before proving the external capture fence. */
+	/* OLR and FDW claim a generation before source preparation and publication. */
 	struct SynchdbArtifactPaths *prepared_artifacts;
 } SynchdbJavaRuntime;
 

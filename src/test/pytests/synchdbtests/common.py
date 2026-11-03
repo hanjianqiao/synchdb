@@ -503,7 +503,7 @@ def stop_and_delete_synchdb_connector(cursor, name):
               FROM synchdb_artifacts a
               JOIN synchdb_conninfo c USING (connector_id)
              WHERE c.name = %s AND c.data->>'connector' = 'postgres'
-               AND a.origin = 'NATIVE'
+               AND a.origin IN ('NATIVE', 'FDW_SEED')
         """, (name,))
         _postgres_generations[name] = [row[0] for row in cursor.fetchall()]
     row = run_pg_query_one(cursor, f"SELECT synchdb_del_conninfo('{name}')")

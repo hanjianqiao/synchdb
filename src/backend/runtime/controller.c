@@ -546,7 +546,7 @@ reconcile(SynchdbControlRow *row)
 
             update_row(row,"PAUSED","PAUSED",complete ? "SUCCEEDED" : "FAILED",
                 complete ? 0 : ERRCODE_EXTERNAL_ROUTINE_EXCEPTION,
-                complete ? "bootstrap completed; CDC resume requires a verified handoff" : view.errmsg,
+                complete ? "bootstrap completed; submit RESUME to start CDC" : view.errmsg,
                 0,DT_NOBEGIN);
             return;
         }
@@ -603,10 +603,11 @@ reconcile(SynchdbControlRow *row)
         update_row(row,"PAUSED","PAUSED","SUCCEEDED",0,"paused without an active worker",0,DT_NOBEGIN);
         return;
     }
-    if (strcmp(row->operation,"RESUME")==0 && row->snapshot_engine==ENGINE_FDW)
+    if (strcmp(row->operation,"RESUME")==0 && row->snapshot_engine==ENGINE_FDW &&
+        strcmp(row->mode,"initial_only")==0)
     {
         update_row(row,"PAUSED","PAUSED","FAILED",ERRCODE_FEATURE_NOT_SUPPORTED,
-                   "FDW bootstrap has no verified CDC handoff; submit an explicit new bootstrap",0,DT_NOBEGIN);
+                   "initial_only is snapshot-only and cannot resume CDC",0,DT_NOBEGIN);
         return;
     }
     if (!pending && strcmp(row->actual,"FAILED")==0)

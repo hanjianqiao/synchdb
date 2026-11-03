@@ -17,6 +17,8 @@ typedef struct SynchdbArtifactPaths
 	char snapshot_filter[MAXPGPATH];
 	/* A committed prior ENGINE_OWNED row, never inferred from file presence. */
 	bool resume_existing;
+	/* Explicit compatibility origin; this is not a verified snapshot fence. */
+	bool fdw_seed;
 	/* Only LEGACY_COPY PostgreSQL generations retain old remote identities. */
 	char postgres_legacy_slot[NAMEDATALEN];
 	char postgres_legacy_publication[NAMEDATALEN];
@@ -28,6 +30,9 @@ extern void synchdb_artifact_paths(const SynchdbConnectorKey *key,
 /* Owns and commits a short transaction; call only from an idle worker before
  * starting an engine. A restart reuses ENGINE_OWNED material, never a seed. */
 extern void synchdb_artifact_store_prepare(const ConnectionInfo *connection,
+		ConnectorType type, SynchdbArtifactPaths *out);
+/* Claim a fresh FDW compatibility generation before reading the source. */
+extern void synchdb_artifact_store_prepare_fdw(const ConnectionInfo *connection,
 		ConnectorType type, SynchdbArtifactPaths *out);
 /* Active-transaction lookup for diagnostics/offset maintenance. */
 extern bool synchdb_artifact_store_lookup(const SynchdbConnectorKey *key,

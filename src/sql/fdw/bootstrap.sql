@@ -13,8 +13,8 @@ AS 'MODULE_PATHNAME','synchdb_bootstrap_validate_transform' LANGUAGE C VOLATILE 
 CREATE OR REPLACE FUNCTION synchdb_source_consistency_contract(text,text,text) RETURNS jsonb
 AS 'MODULE_PATHNAME','synchdb_source_consistency_contract' LANGUAGE C IMMUTABLE PARALLEL SAFE;
 
--- A target bootstrap is not a CDC handoff.  The result intentionally contains
--- no runnable offset/history and does not claim a synchronized remote session.
+-- TODO: FDW continuation is permitted with legacy candidate coordinates;
+-- neither this result nor its offset/history proves a synchronized read view.
 CREATE OR REPLACE FUNCTION synchdb_bootstrap_relation_descriptor(p_relation oid)
 RETURNS jsonb LANGUAGE sql STABLE SET search_path = pg_catalog
 SET quote_all_identifiers = on AS $sql$
@@ -204,6 +204,16 @@ DECLARE
     v_policy text;
     v_case text;
     v_copy boolean;
+    v_handoff boolean;
+    v_after text;
+    v_history jsonb := '[]'::jsonb;
+    v_offset jsonb;
+    v_resume jsonb;
+    v_binlog_file text;
+    v_binlog_pos bigint;
+    v_server_id text;
+    v_lsn bigint;
+    v_commit_lsn text;
     v_generation uuid;
     v_prefix text;
     v_source name;
@@ -278,14 +288,14 @@ BEGIN
         RAISE EXCEPTION 'Bootstrap callers cannot supply source consistency or CDC handoff proof'
             USING ERRCODE = '22023';
     END IF;
-    v_mode := p_request->>'mode';
-    IF v_mode IN ('initial', 'no_data', 'always') THEN
-        RAISE EXCEPTION 'FDW bootstrap cannot establish a verified CDC handoff for mode %', v_mode
-            USING ERRCODE = '0A000', HINT = 'Use initial_only or schemasync; source-consistent CDC handoff requires a provider-specific protocol.';
-    ELSIF v_mode IS NULL OR v_mode NOT IN ('initial_only', 'schemasync') THEN
+    v_mode := lower(p_request->>'mode');
+    IF v_mode IS NULL OR v_mode NOT IN ('initial_only', 'schemasync', 'initial', 'always', 'no_data', 'never') THEN
         RAISE EXCEPTION 'Unsupported FDW bootstrap mode: %', v_mode USING ERRCODE = '22023';
     END IF;
-    v_copy := v_mode = 'initial_only';
+    v_copy := v_mode IN ('initial_only', 'initial', 'always');
+    v_handoff := v_mode <> 'initial_only';
+    v_after := CASE WHEN v_mode = 'initial_only' THEN 'STOP'
+                    WHEN v_copy THEN 'CDC' ELSE 'PAUSE' END;
     v_failure := coalesce(p_request->>'failure_policy', 'fail_fast');
     v_policy := coalesce(p_request->>'target_policy', 'error');
     v_case := coalesce(p_request->>'case_strategy', 'asis');
@@ -464,20 +474,64 @@ BEGIN
             END IF;
         END LOOP;
     END IF;
-    IF v_connector IN ('oracle', 'olr') AND v_copy THEN
+    -- TODO: coordinate this candidate with the FDW remote read view and
+    -- in-flight transactions. This restores the legacy runnable handoff only;
+    -- source_read_boundary.cdc_verified deliberately remains false.
+    IF v_connector IN ('oracle', 'olr') AND (v_copy OR v_handoff) THEN
         PERFORM synchdb_create_current_scn_ft(v_meta, v_server);
         EXECUTE format('SELECT current_scn FROM %I.current_scn', v_meta) INTO STRICT v_scn;
         IF v_scn IS NULL OR v_scn <= 0 OR v_scn <> trunc(v_scn) THEN
             RAISE EXCEPTION 'Invalid Oracle data-read SCN' USING ERRCODE = '22000';
         END IF;
         v_candidate := jsonb_build_object('scn', v_scn);
+        v_offset := jsonb_build_object('commit_scn', (v_scn + 1)::text,
+            'snapshot_scn', v_scn::text, 'scn', v_scn::text);
         v_boundary := 'ORACLE_AS_OF_SCN_DATA_ONLY';
+    ELSIF v_connector = 'mysql' AND v_handoff THEN
+        PERFORM synchdb_create_current_binlog_pos_ft(v_meta, v_server);
+        EXECUTE format('SELECT local::jsonb->>''binary_log_file'',
+            (local::jsonb->>''binary_log_position'')::bigint FROM %I.log_status LIMIT 1', v_meta)
+            INTO STRICT v_binlog_file, v_binlog_pos;
+        EXECUTE format('SELECT variable_value FROM %I.global_variables
+            WHERE lower(variable_name) = ''server_id'' LIMIT 1', v_meta) INTO STRICT v_server_id;
+        IF v_binlog_file IS NULL OR v_binlog_pos IS NULL OR v_binlog_pos < 0 OR v_server_id IS NULL THEN
+            RAISE EXCEPTION 'Invalid MySQL CDC candidate' USING ERRCODE = '22000';
+        END IF;
+        v_candidate := jsonb_build_object('file', v_binlog_file, 'pos', v_binlog_pos,
+            'server_id', v_server_id, 'ts_sec', floor(extract(epoch FROM clock_timestamp())));
+        v_offset := v_candidate || jsonb_build_object('snapshot_completed', true);
+    ELSIF v_connector = 'postgres' AND v_handoff THEN
+        PERFORM synchdb_create_current_lsn_ft(v_meta, v_server);
+        EXECUTE format('SELECT (wal_lsn - ''0/0''::pg_lsn)::bigint FROM %I.wal_lsn', v_meta) INTO STRICT v_lsn;
+        IF v_lsn IS NULL OR v_lsn <= 0 THEN
+            RAISE EXCEPTION 'Invalid PostgreSQL CDC candidate' USING ERRCODE = '22000';
+        END IF;
+        v_candidate := jsonb_build_object('lsn', v_lsn);
+        v_offset := v_candidate;
+    ELSIF v_connector = 'sqlserver' AND v_handoff THEN
+        PERFORM synchdb_create_current_sqlserver_lsn_ft(v_meta, v_server);
+        EXECUTE format('SELECT max_lsn FROM %I.current_lsn', v_meta) INTO STRICT v_commit_lsn;
+        IF v_commit_lsn IS NULL OR v_commit_lsn !~ '^[0-9a-f]{8}:[0-9a-f]{8}:[0-9a-f]{4}$'
+           OR v_commit_lsn = '00000000:00000000:0000' THEN
+            RAISE EXCEPTION 'Invalid SQL Server CDC candidate' USING ERRCODE = '22000';
+        END IF;
+        v_candidate := jsonb_build_object('commit_lsn', v_commit_lsn);
+        -- Recovery reconstructs history without re-copying FDW target rows.
+        v_offset := v_candidate || jsonb_build_object('change_lsn', 'NULL',
+            'snapshot', true, 'snapshot_completed', false);
     ELSIF NOT v_copy THEN
         v_boundary := 'METADATA_ONLY';
     END IF;
     PERFORM synchdb_create_stage_fts_plan(v_name, v_db, v_owner,
         v_stage, v_server, v_case = 'lower', 'error', v_candidate::text,
-        v_meta, NULL::text, false, v_case, v_selected, false);
+        v_meta, NULL::text, v_handoff AND v_connector IN ('mysql','oracle'), v_case, v_selected, false);
+    IF v_handoff AND v_connector IN ('mysql','oracle') THEN
+        EXECUTE format('SELECT coalesce(jsonb_agg(line::jsonb), ''[]''::jsonb) FROM %I.schema_history', v_stage)
+            INTO v_history;
+        IF jsonb_array_length(v_history) <> jsonb_array_length(v_selected) THEN
+            RAISE EXCEPTION 'FDW handoff history does not cover every selected table' USING ERRCODE = '55000';
+        END IF;
+    END IF;
     -- Freeze all final target identities, columns and PKs before local target
     -- DDL or copying.  A malformed/colliding plan is a global preflight error.
     FOR v_source_id IN SELECT value FROM jsonb_array_elements(v_selected) LOOP
@@ -595,7 +649,7 @@ BEGIN
         'connector_name',v_name,'config_revision',v_revision,'provider',v_connector,
         'config_fingerprint',md5(v_config::text),'selection_fingerprint',md5(v_selected::text),
         'mapping_fingerprint',md5(v_mappings::text),'schema_fingerprint',md5(v_tables::text),
-        'copy_data',v_copy,'after_bootstrap',CASE WHEN v_copy THEN 'STOP' ELSE 'PAUSE' END,
+        'copy_data',v_copy,'after_bootstrap',v_after,
         'failure_policy',v_failure,'target_policy',v_policy,'case_strategy',v_case,
         'selection',v_selected,'mapping_snapshot',v_mappings,'tables',v_tables,'artifact_intents',v_artifact_intents,
         'source_read_policy',v_boundary,'candidate_boundary',v_candidate,
@@ -726,11 +780,15 @@ BEGIN
         END;
     END LOOP;
     PERFORM synchdb_bootstrap_cleanup(v_resources);
+    IF v_handoff AND v_failed = 0 THEN
+        v_resume := jsonb_build_object('offset',v_offset,'history',v_history);
+    END IF;
     v_result := jsonb_build_object('version',1,'status',CASE WHEN v_failed = 0 THEN 'COMPLETE'
              WHEN v_success > 0 THEN 'PARTIAL' ELSE 'FAILED' END,
         'generation',v_generation,'copy_data',v_copy,
-        'after_bootstrap',CASE WHEN v_copy THEN 'STOP' ELSE 'PAUSE' END,
-        'cdc_eligible',false,'cdc_resume_material',NULL,
+        'after_bootstrap',v_after,
+        'cdc_eligible',v_handoff AND v_failed = 0,'cdc_resume_material',v_resume,
+        'handoff_verified',false,
         'retry_disposition',CASE WHEN v_failed = 0 THEN 'NONE' ELSE 'RESTART_BOOTSTRAP' END,
         'source_read_boundary',jsonb_build_object('kind',v_boundary,'candidate',v_candidate,'cdc_verified',false),
         'source_consistency',v_read_contract,

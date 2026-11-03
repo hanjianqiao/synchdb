@@ -194,15 +194,6 @@ synchdb_run_spec_init(SynchdbRunSpec *out, ConnectorType type,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("PostgreSQL Debezium connectors do not support automatic schema sync"),
 				 errhint("Use the FDW snapshot engine for schema sync.")));
-	if (spec.snapshot_provider == SYNCHDB_SNAPSHOT_FDW &&
-		!(spec.connection.flag & CONNFLAG_SCHEMA_SYNC_MODE) &&
-		pg_strcasecmp(spec.snapshot_mode, "initial_only") != 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("FDW bootstrap cannot establish a verified CDC handoff for mode %s",
-						spec.snapshot_mode),
-				 errhint("Use initial_only or schemasync; select the capture provider for engine-owned CDC.")));
-
 	synchdb_source_consistency_validate_run(&spec);
 	*out = spec;
 }

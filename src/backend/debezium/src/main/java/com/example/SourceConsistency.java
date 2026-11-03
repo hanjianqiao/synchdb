@@ -93,6 +93,11 @@ final class SourceConsistency
     /** Call after every property has been assembled, immediately before build(). */
     static void configure(Properties properties, int connectorType)
     {
+        configure(properties, connectorType, false);
+    }
+
+    static void configure(Properties properties, int connectorType, boolean fdwHandoff)
+    {
         if (properties == null)
             throw new IllegalArgumentException("Native source consistency properties are required");
         properties.forEach((key,value) -> {
@@ -102,11 +107,14 @@ final class SourceConsistency
         requireVersion(connectorType);
         require(properties, "connector.class", connectorClass(connectorType));
         String mode = properties.getProperty("snapshot.mode", "initial");
-        if (!MODES.contains(mode))
+        // TODO: replace this compatibility path with a coordinated FDW fence.
+        // Recovery is allowed only for explicitly owned FDW seeds, preserving
+        // the stricter native-snapshot policy for every ordinary engine start.
+        if (!MODES.contains(mode) && !(fdwHandoff && connectorType == 3 && "recovery".equals(mode)))
             throw new IllegalArgumentException("Unsupported native source consistency snapshot mode");
         if ("never".equals(mode) && connectorType != 1 && connectorType != 5)
             throw new IllegalArgumentException("This native connector does not support snapshot mode never");
-        if (connectorType == 3 && ("initial".equals(mode) || "always".equals(mode)))
+        if (!fdwHandoff && connectorType == 3 && ("initial".equals(mode) || "always".equals(mode)))
             throw new IllegalArgumentException("SQL Server native snapshot-to-CDC requires an unimplemented capture-drain fence; use initial_only or explicit no_data");
         properties.setProperty("snapshot.mode", mode);
 
@@ -125,7 +133,7 @@ final class SourceConsistency
         require(properties, "schema.history.internal.skip.unparseable.ddl", "false");
         require(properties, "incremental.snapshot.allow.schema.changes", "false");
 
-        if (("initial".equals(mode) || "initial_only".equals(mode) || "always".equals(mode)) &&
+        if (!fdwHandoff && ("initial".equals(mode) || "initial_only".equals(mode) || "always".equals(mode)) &&
             !(connectorType == 4 && "initial_only".equals(mode)))
         {
             String snapshot = properties.getProperty("snapshot.include.collection.list");

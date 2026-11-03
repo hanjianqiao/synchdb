@@ -271,8 +271,12 @@ def test_FDWBootstrap(pg_cursor, dbvendor, fdw_engine, mode, casing):
         create_and_start_synchdb_connector(pg_cursor, dbvendor, name, mode, srctable=selection)
         result = common.get_bootstrap_result(pg_cursor, name)
         assert result["status"] == "COMPLETE", result
-        assert result["cdc_eligible"] is False
-        assert result["cdc_resume_material"] is None
+        assert result["cdc_eligible"] is (mode == "schemasync")
+        assert result["handoff_verified"] is False, result
+        if mode == "initial_only":
+            assert result["cdc_resume_material"] is None
+        else:
+            assert result["cdc_resume_material"] is not None, result
         assert result["resources_disposition"] == "CLEANED"
         assert len(result["tables"]) == 1, result
         copied = result["tables"][0]
@@ -297,14 +301,8 @@ def test_FDWBootstrap(pg_cursor, dbvendor, fdw_engine, mode, casing):
             row = pg_cursor.fetchone()
             assert row == (1, "snapshot row")
         else:
-            # A metadata bootstrap is paused. RESUME must not invent a CDC
-            # boundary; its asynchronous receipt reports the rejection.
-            pg_cursor.execute("SELECT synchdb_resume_engine(%s)", (name,))
-            receipt = wait_for_operation(pg_cursor, pg_cursor.fetchone()[0], expected_status="FAILED")
-            assert receipt["sqlstate"] == "0A000", receipt
-            pg_cursor.execute(sql.SQL("SELECT count(*) FROM {}.{}").format(
-                sql.Identifier(dbname), sql.Identifier(table)))
-            assert pg_cursor.fetchone()[0] == 0
+            pg_cursor.execute("SELECT actual_state FROM synchdb_control_view WHERE name=%s", (name,))
+            assert pg_cursor.fetchone()[0] == "PAUSED"
         stop_and_delete_synchdb_connector(pg_cursor, name)
         drop_default_pg_schema(pg_cursor, dbvendor)
     finally:
@@ -312,18 +310,142 @@ def test_FDWBootstrap(pg_cursor, dbvendor, fdw_engine, mode, casing):
         update_guc_conf(pg_cursor, "synchdb.letter_casing_strategy", "'lowercase'", True)
 
 
-@pytest.mark.parametrize("mode", ["initial", "always", "no_data", "never"])
-def test_FDWRejectsUnverifiedHandoff(pg_cursor, dbvendor, fdw_config, mode):
-    name = getConnectorName(dbvendor) + "_fdw_reject"
-    create_synchdb_connector(pg_cursor, dbvendor, name)
-    with pytest.raises(FeatureNotSupported, match="verified CDC handoff"):
-        pg_cursor.execute("SELECT synchdb_start_engine_bgw(%s, %s)", (name, mode))
-    pg_cursor.execute("""
-        SELECT count(*) FROM synchdb_artifacts a
-        JOIN synchdb_conninfo c USING (connector_id) WHERE c.name = %s
-    """, (name,))
-    assert pg_cursor.fetchone()[0] == 0
-    stop_and_delete_synchdb_connector(pg_cursor, name)
+def _wait_for_fdw_rows(cursor, name, query, expected, timeout=240):
+    """Check complete target contents after each committed source change."""
+    deadline = time.monotonic() + timeout
+    last = None
+    while True:
+        cursor.execute(query)
+        last = [(int(row[0]), row[1]) for row in cursor.fetchall()]
+        if last == expected:
+            return
+        cursor.execute("SELECT actual_state,last_error FROM synchdb_control_view WHERE name=%s", (name,))
+        state = cursor.fetchone()
+        assert state and state[0] not in ("FAILED", "RETRY_WAIT", "STOPPED"), state
+        assert time.monotonic() < deadline, f"FDW CDC rows did not arrive: expected={expected}, actual={last}, state={state}"
+        time.sleep(0.2)
+
+
+def _fdw_snapshot_and_cdc(cursor, vendor, casing, mode):
+    """Restore the legacy bootstrap/CDC flow with a small selected fixture.
+
+    TODO: Add writes during the FDW-to-CDC transition once a consistent source
+    snapshot/offset handoff is implemented. These cases only prove that CDC
+    continues after bootstrap; the source stays idle across that transition.
+    """
+    name = getConnectorName(vendor) + "_fdw_" + mode + "_" + casing
+    source_table = "fdw_cdc_test"
+    source_upper = vendor in ("oracle", "oracle23ai", "olr")
+    source_name = source_table.upper() if source_upper else source_table
+    source_scope = getSchema(vendor) or getDbname(vendor)
+    selection = f"{source_scope}.{source_name}"
+    schema = getDbname(vendor)
+    table = source_name
+    columns = ["ID", "NOTE"] if source_upper else ["id", "note"]
+    if casing == "uppercase":
+        schema, table = schema.upper(), table.upper()
+        columns = [column.upper() for column in columns]
+    elif casing == "lowercase":
+        schema, table = schema.lower(), table.lower()
+        columns = [column.lower() for column in columns]
+    query = sql.SQL("SELECT {},{} FROM {}.{} ORDER BY {}").format(
+        sql.Identifier(columns[0]), sql.Identifier(columns[1]),
+        sql.Identifier(schema), sql.Identifier(table), sql.Identifier(columns[0]))
+    cursor.execute("SHOW synchdb.letter_casing_strategy")
+    previous_casing = cursor.fetchone()[0]
+    update_guc_conf(cursor, "synchdb.letter_casing_strategy", f"'{casing}'", True)
+    created = False
+    try:
+        run_remote_query(vendor, f"CREATE TABLE {source_table} (id INTEGER NOT NULL PRIMARY KEY, note VARCHAR(20))")
+        created = True
+        if vendor == "sqlserver":
+            run_remote_query(vendor,
+                "EXEC sys.sp_cdc_enable_table @source_schema='dbo', "
+                f"@source_name='{source_table}', @role_name=NULL, @supports_net_changes=0")
+        if source_upper and mode in ("initial", "always"):
+            # Let freshly created Oracle tables become Flashback-readable.
+            time.sleep(15)
+        run_remote_query(vendor, f"INSERT INTO {source_table} VALUES (1,'snapshot row')")
+        operation_id = create_and_start_synchdb_connector(cursor, vendor, name, mode, srctable=selection)
+        assert operation_id > 0
+        result = common.get_bootstrap_result(cursor, name)
+        assert result["status"] == "COMPLETE", result
+        assert result["cdc_eligible"] is True, result
+        assert result["handoff_verified"] is False, result
+        assert len(result["tables"]) == 1, result
+        copied = result["tables"][0]
+        assert copied["target_schema"] == schema, copied
+        assert copied["target_name"] == table, copied
+        assert copied["status"] == "COMPLETE", copied
+        cursor.execute("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema=%s AND table_name=%s ORDER BY ordinal_position
+        """, (schema, table))
+        assert [row[0] for row in cursor.fetchall()] == columns
+        # Preserve the original cases' table/column/type mapping checks.
+        cursor.execute("""
+            SELECT ext_tbname,pg_tbname,ext_attname,pg_attname,
+                   ext_atttypename,pg_atttypename
+            FROM synchdb_att_view WHERE name=%s ORDER BY attnum
+        """, (name,))
+        mappings = cursor.fetchall()
+        assert len(mappings) == 2, mappings
+        assert [row[3] for row in mappings] == columns
+        for mapping in mappings:
+            assert mapping[0].rsplit(".", 1)[-1].lower() == source_table
+            assert mapping[1] == f"{schema}.{table}"
+            assert verify_default_type_mappings(mapping[4], mapping[5], vendor)
+        baseline = [(1, "snapshot row")] if mode in ("initial", "always") else []
+        assert copied["rows"] == len(baseline), copied
+        cursor.execute(query)
+        assert [(int(row[0]), row[1]) for row in cursor.fetchall()] == baseline
+        if mode == "schemasync":
+            cursor.execute("SELECT actual_state FROM synchdb_control_view WHERE name=%s", (name,))
+            assert cursor.fetchone()[0] == "PAUSED"
+            cursor.execute("SELECT synchdb_control(%s::name,'RESUME')", (name,))
+            wait_for_operation(cursor, cursor.fetchone()[0])
+        wait_for_connector_cdc(cursor, name, timeout=300)
+        # Exercise INSERT, UPDATE and DELETE separately. Source writes begin
+        # only after CDC is polling, so they do not hide the known handoff gap.
+        run_remote_query(vendor, f"INSERT INTO {source_table} VALUES (2,'cdc insert')")
+        _wait_for_fdw_rows(cursor, name, query, baseline + [(2, "cdc insert")])
+        run_remote_query(vendor, f"UPDATE {source_table} SET note='cdc update' WHERE id=2")
+        _wait_for_fdw_rows(cursor, name, query, baseline + [(2, "cdc update")])
+        run_remote_query(vendor, f"DELETE FROM {source_table} WHERE id=2")
+        _wait_for_fdw_rows(cursor, name, query, baseline)
+        if baseline:
+            # Snapshot rows must also have usable CDC bindings and primary keys.
+            run_remote_query(vendor, f"UPDATE {source_table} SET note='snapshot updated' WHERE id=1")
+            _wait_for_fdw_rows(cursor, name, query, [(1, "snapshot updated")])
+            run_remote_query(vendor, f"DELETE FROM {source_table} WHERE id=1")
+            _wait_for_fdw_rows(cursor, name, query, [])
+    finally:
+        try:
+            stop_and_delete_synchdb_connector(cursor, name)
+            drop_repslot_and_pub(vendor, name, "postgres")
+            drop_default_pg_schema(cursor, vendor)
+        finally:
+            try:
+                if created:
+                    run_remote_query(vendor, f"DROP TABLE {source_table}")
+            finally:
+                update_guc_conf(cursor, "synchdb.letter_casing_strategy", f"'{previous_casing}'", True)
+
+
+def test_InitialSnapshotFDW(pg_cursor, dbvendor, fdw_engine):
+    _fdw_snapshot_and_cdc(pg_cursor, dbvendor, "lowercase", "initial")
+
+
+def test_InitialSnapshotFDW_uppercase(pg_cursor, dbvendor, fdw_engine):
+    _fdw_snapshot_and_cdc(pg_cursor, dbvendor, "uppercase", "initial")
+
+
+def test_InitialSnapshotFDW_asis(pg_cursor, dbvendor, fdw_engine):
+    _fdw_snapshot_and_cdc(pg_cursor, dbvendor, "asis", "initial")
+
+
+def test_ConnectorStartSchemaSyncModeFDW(pg_cursor, dbvendor, fdw_engine):
+    _fdw_snapshot_and_cdc(pg_cursor, dbvendor, "lowercase", "schemasync")
 
 
 

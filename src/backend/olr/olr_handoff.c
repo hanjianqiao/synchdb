@@ -1,4 +1,5 @@
-/* A source-proven snapshot boundary and a target-transactional OLR cursor. */
+/* Source-fenced OLR transport and a target-transactional cursor. Native
+ * snapshots carry a read-view proof; the FDW compatibility path does not. */
 #include "postgres.h"
 #include "access/xact.h"
 #include "catalog/catalog_access.h"
@@ -20,6 +21,22 @@ static SynchdbArtifactPaths paths;
 static Jsonb *source_proof;
 static uint64 snapshot_scn;
 static bool active;
+
+#define OLR_FDW_PROTOCOL "UNVERIFIED_FDW_CDC_HANDOFF_V1"
+
+static bool
+fdw_compatibility_proof(Jsonb *proof)
+{
+	JsonbValue buffer;
+	JsonbValue *value;
+
+	if (!proof || !JB_ROOT_IS_OBJECT(proof))
+		return false;
+	value = getKeyJsonValueFromContainer(&proof->root, "protocol", 8, &buffer);
+	return value && value->type == jbvString &&
+		(Size) value->val.string.len == strlen(OLR_FDW_PROTOCOL) &&
+		memcmp(value->val.string.val, OLR_FDW_PROTOCOL, strlen(OLR_FDW_PROTOCOL)) == 0;
+}
 
 char *
 olr_json_text(Jsonb *object, const char *field)
@@ -148,6 +165,21 @@ preflight(const ConnectionInfo *connection, SynchdbJavaRuntime *java)
 	PG_END_TRY();
 	caller = MemoryContextSwitchTo(TopMemoryContext);
 	proof = DatumGetJsonbP(DirectFunctionCall1(jsonb_in, CStringGetDatum(answer)));
+	if (fdw_compatibility_proof(source_proof))
+	{
+		Jsonb *marker = DatumGetJsonbP(DirectFunctionCall1(jsonb_in,
+			CStringGetDatum("{\"protocol\":\"" OLR_FDW_PROTOCOL "\","
+							"\"handoff_verified\":false,\"cdc_verified\":false}")));
+		Jsonb *combined = DatumGetJsonbP(DirectFunctionCall2(jsonb_concat,
+			JsonbPGetDatum(proof), JsonbPGetDatum(marker)));
+
+		/* Java refreshes the real source identity and socket fence, but only
+		 * carries native snapshot fields forward. Keep the FDW qualification
+		 * across restart/reconnect; a new fence does not verify an old read. */
+		pfree(proof);
+		pfree(marker);
+		proof = combined;
+	}
 	MemoryContextSwitchTo(caller);
 	pfree(answer);
 	if (source_proof)
@@ -277,6 +309,55 @@ olr_handoff_complete(const ConnectionInfo *connection, SynchdbJavaRuntime *java)
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 	elog(LOG, "OLR snapshot handoff committed at SCN %llu", (unsigned long long) snapshot_scn);
+}
+
+void
+olr_handoff_complete_fdw(const ConnectionInfo *connection, Jsonb *material)
+{
+	Datum offset_path[] = {CStringGetTextDatum("offset")};
+	Jsonb *offset;
+	uint64 candidate;
+	char *boundary_json;
+	Jsonb *boundary;
+	Jsonb *combined;
+	MemoryContext caller;
+
+	if (!connection || !active || !source_proof || !material || !JB_ROOT_IS_OBJECT(material))
+		elog(ERROR, "OLR FDW compatibility handoff requires prepared source evidence");
+	if (connection->key.database_oid != key.database_oid ||
+		memcmp(&connection->key.connector_id, &key.connector_id, sizeof(pg_uuid_t)) != 0)
+		elog(ERROR, "OLR FDW compatibility handoff connector identity changed");
+	offset = GET_JSONB_ELEM(material, offset_path, 1);
+	if (!offset || !JB_ROOT_IS_OBJECT(offset))
+		elog(ERROR, "OLR FDW compatibility handoff requires a source SCN offset");
+	candidate = olr_json_uint(offset, "scn");
+	if (!candidate || candidate < olr_json_uint(source_proof, "fence_scn_upper_bound"))
+		elog(ERROR, "OLR FDW compatibility boundary precedes its source fence");
+
+	/* TODO: Bind FDW metadata/data reads to the OLR replay boundary, including
+	 * transactions crossing the read SCN. The captured candidate only enables
+	 * legacy CDC continuation; it is not a native snapshot witness. */
+	boundary_json = psprintf("{\"protocol\":\"" OLR_FDW_PROTOCOL "\","
+		"\"handoff_verified\":false,\"cdc_verified\":false,"
+		"\"snapshot_pending_xids\":{},\"scn\":\"%llu\"}",
+		(unsigned long long) candidate);
+	boundary = DatumGetJsonbP(DirectFunctionCall1(jsonb_in, CStringGetDatum(boundary_json)));
+	caller = MemoryContextSwitchTo(TopMemoryContext);
+	combined = DatumGetJsonbP(DirectFunctionCall2(jsonb_concat,
+		JsonbPGetDatum(source_proof), JsonbPGetDatum(boundary)));
+	pfree(source_proof);
+	source_proof = combined;
+	snapshot_scn = candidate;
+	MemoryContextSwitchTo(caller);
+	pfree(boundary);
+	pfree(boundary_json);
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	store_state(false);
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+	elog(LOG, "OLR FDW compatibility handoff committed at SCN %llu (snapshot-to-CDC consistency unverified)",
+		 (unsigned long long) snapshot_scn);
 }
 
 bool

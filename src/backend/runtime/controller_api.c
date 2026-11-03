@@ -232,7 +232,16 @@ synchdb_control_enqueue(const char *name, const char *operation,
                 errhint("Use the accepted execution role or a role allowed to SET ROLE to it.")));
         if ((operation_is(op,"OFFSET") || operation_is(op,"MEMDUMP") || operation_is(op,"LOGLEVEL")) &&
             DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],SPI_tuptable->tupdesc,5,&isnull))==ENGINE_FDW)
-            ereport(ERROR,(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),errmsg("FDW bootstrap has no Debezium runtime to maintain")));
+        {
+            SynchdbRunHandle run;
+            SynchdbRunView view;
+
+            if (!synchdb_registry_find_run(registry,&key,&run) ||
+                !synchdb_registry_read_slot(registry,run.slot,NULL,&view) ||
+                view.stage!=STAGE_CHANGE_DATA_CAPTURE)
+                ereport(ERROR,(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                    errmsg("FDW bootstrap has not prepared its CDC runtime")));
+        }
         if (operation_is(op,"START") && synchdb_registry_find_run(
             registry,&key,&existing))
         {

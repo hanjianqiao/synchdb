@@ -887,18 +887,21 @@ processRequestInterrupt(SynchdbWorkerRun *run, int connectorId)
 	else if (reqcopy->reqstate == STATE_SYNCING && *currstatecopy == STATE_PAUSED)
 	{
 		synchdb_registry_report_ready(sdb_state, &worker.owner, false);
-		if (worker.bootstrap != NULL)
+		if (worker.bootstrap != NULL &&
+			(worker.bootstrap->status != SYNCHDB_BOOTSTRAP_COMPLETE ||
+			 !worker.bootstrap->cdc_eligible))
 		{
 			set_shm_connector_errmsg(connectorId,
-				"FDW bootstrap has no verified CDC handoff. Inspect its result and explicitly restart bootstrap or use a supported capture protocol.");
-            synchdb_registry_complete_request(sdb_state,&worker.owner,reqcopy->command_id,false,
-                ERRCODE_FEATURE_NOT_SUPPORTED,"FDW bootstrap has no verified CDC handoff");
-            worker.command_id=0;
-            pfree(reqcopy);
-            pfree(currstatecopy);
-            return false;
-        }
-        /* Handle resume request, we can only transition to STATE_SYNCING from STATE_PAUSED */
+				"FDW bootstrap is incomplete or snapshot-only; CDC cannot resume.");
+			synchdb_registry_complete_request(sdb_state, &worker.owner, reqcopy->command_id, false,
+				ERRCODE_FEATURE_NOT_SUPPORTED,
+				"FDW bootstrap is incomplete or snapshot-only; CDC cannot resume");
+			worker.command_id = 0;
+			pfree(reqcopy);
+			pfree(currstatecopy);
+			return false;
+		}
+		/* Handle resume request, we can only transition to STATE_SYNCING from STATE_PAUSED */
 		elog(LOG, "Resuming %s connector. Current state: %s, Requested state: %s",
 			 connectorTypeToString(type),
 			 connectorStateAsString(*currstatecopy),
@@ -954,18 +957,12 @@ processRequestInterrupt(SynchdbWorkerRun *run, int connectorId)
 				if ((connInfo->flag & (CONNFLAG_SCHEMA_SYNC_MODE |
 						CONNFLAG_INITIAL_SNAPSHOT_MODE)) == 0 )
 				{
-					const char *resumeMode = !strcasecmp(snapshotMode, "recovery") ?
-						"initial" : snapshotMode;
+					const char *resumeMode = "initial";
 
 					if (connInfo->flag & CONNFLAG_NO_CDC_MODE)
 						elog(ERROR, "cannot resume CDC for an initial_only connector");
-
-					/*
-					 * A SQL Server FDW schema-sync handoff has an incomplete
-					 * snapshot marker until Debezium has rebuilt schema history.
-					 */
 					if (type == TYPE_SQLSERVER &&
-							!dbz_read_snapshot_state(type, get_shm_dbz_offset(connectorId)))
+						!dbz_read_snapshot_state(type, get_shm_dbz_offset(connectorId)))
 						resumeMode = "recovery";
 
 					ret = dbz_engine_start(connInfo, type, resumeMode);
@@ -1432,6 +1429,56 @@ validate_schema_sync_request(ConnectorType type, int snapshotEngine, int flag)
 				 errhint("Use the FDW snapshot engine for schema sync.")));
 }
 
+/* A committed engine generation is the authority for stop/start continuation.
+ * File presence alone must never turn an interrupted FDW bootstrap into CDC. */
+static bool
+fdw_has_artifacts(const ConnectionInfo *connection)
+{
+	SynchdbArtifactPaths paths;
+	bool found = false;
+	bool previous = synchdb_worker_sql_interruptible();
+
+	PG_TRY();
+	{
+		synchdb_worker_sql_enter();
+		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
+		found = synchdb_artifact_store_lookup(&connection->key, &paths);
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+	}
+	PG_FINALLY();
+	{
+		synchdb_worker_sql_restore(previous);
+	}
+	PG_END_TRY();
+	return found;
+}
+
+static void
+start_fdw_capture(ConnectorType type, ConnectionInfo *connection)
+{
+	/* TODO: coordinate the FDW source read view, schema history and CDC offset.
+	 * This restores the legacy continuation without claiming that boundary is
+	 * consistent while the source changes during the snapshot. */
+	connection->flag &= ~(CONNFLAG_INITIAL_SNAPSHOT_MODE | CONNFLAG_SCHEMA_SYNC_MODE |
+		CONNFLAG_NO_CDC_MODE);
+	set_shm_connector_stage(myConnectorId, STAGE_CHANGE_DATA_CAPTURE);
+	if (connection->run_options.cdc_start_delay_ms > 0)
+		usleep(connection->run_options.cdc_start_delay_ms * 1000);
+#ifdef WITH_OLR
+	if (type == TYPE_OLR)
+	{
+		try_reconnect_olr(connection);
+		set_shm_connector_state(myConnectorId, STATE_SYNCING);
+		synchdb_registry_report_ready(sdb_state, &worker.owner, true);
+		return;
+	}
+#endif
+	start_debezium_engine(type, connection,
+		type == TYPE_SQLSERVER ? "recovery" : "initial");
+}
+
 /* Select this run's work without turning a snapshot-only request into CDC. */
 static bool
 start_snapshot_run(ConnectorType type, ConnectionInfo *connInfo, const char *snapshotMode)
@@ -1457,10 +1504,49 @@ start_snapshot_run(ConnectorType type, ConnectionInfo *connInfo, const char *sna
 	if (worker.bootstrap)
 	{
 		pfree(worker.bootstrap->detail);
+		if (worker.bootstrap->resume_material)
+			pfree(worker.bootstrap->resume_material);
 		pfree(worker.bootstrap);
 		worker.bootstrap = NULL;
 	}
-	connInfo->flag |= CONNFLAG_INITIAL_SNAPSHOT_MODE | CONNFLAG_NO_CDC_MODE;
+	if (!(connInfo->flag & CONNFLAG_NO_CDC_MODE))
+	{
+		bool resume = false;
+
+		if (!worker.java.creation_attempted)
+			initialize_jvm(&connInfo->jmx, &connInfo->run_options);
+#ifdef WITH_OLR
+		if (type == TYPE_OLR)
+			resume = olr_handoff_prepare(connInfo, &worker.java);
+		else
+#endif
+			resume = fdw_has_artifacts(connInfo);
+		if (resume)
+		{
+			/* A failed bootstrap can leave the generation claimed, while its
+			 * running worker still owns fresh, unpublished preparation state.
+			 * RESTART must not bypass the on-disk resume checks via that cache. */
+			if (worker.java.prepared_artifacts &&
+				!worker.java.prepared_artifacts->resume_existing)
+				ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("FDW bootstrap has no published CDC continuation"),
+					 errhint("Stop the connector and explicitly recover or reset the artifact generation.")));
+			if (pg_strcasecmp(snapshotMode, "always") == 0)
+				ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("FDW always mode requires a fresh target and artifact generation")));
+			start_fdw_capture(type, connInfo);
+			synchdb_registry_report_bootstrap(sdb_state, &worker.owner,
+				(int) SYNCHDB_BOOTSTRAP_COMPLETE + 1);
+			return true;
+		}
+#ifdef WITH_OLR
+		if (type != TYPE_OLR)
+#endif
+			synchdb_java_prepare_fdw_source(&worker.java, connInfo, type);
+	}
+	connInfo->flag |= CONNFLAG_INITIAL_SNAPSHOT_MODE;
 	set_shm_connector_state(myConnectorId, STATE_SYNCING);
 	return true;
 }
@@ -1841,8 +1927,6 @@ main_loop(SynchdbWorkerRun *run)
 			}
 			case STATE_SCHEMA_SYNC_DONE:
 			{
-				if (connInfo->snapengine == ENGINE_FDW)
-					elog(ERROR, "FDW bootstrap cannot enter a CDC handoff state");
 				switch(connectorType)
 				{
 					case TYPE_MYSQL:
@@ -2268,8 +2352,7 @@ launch_fdw_based_snapshot(ConnectorType connectorType, ConnectionInfo *connInfo,
 	bool previous = synchdb_worker_sql_interruptible();
 	char *compatible_mode = NULL;
 
-	(void) connectorType;
-	(void) schemahistory; /* History publication belongs to verified handoff. */
+	(void) schemahistory; /* The structured result carries frozen history. */
 	spec.connection = *connInfo;
 	strlcpy(spec.snapshot_mode, snapshotMode, sizeof(spec.snapshot_mode));
 	synchdb_bootstrap_require_mode(snapshotMode,
@@ -2306,20 +2389,44 @@ launch_fdw_based_snapshot(ConnectorType connectorType, ConnectionInfo *connInfo,
 	}
 	PG_END_TRY();
 	worker.bootstrap = result;
-	synchdb_registry_report_bootstrap(sdb_state, &worker.owner, (int) result->status + 1);
-	/* Retain bootstrap flags: a resume command cannot jump into CDC. */
-	set_shm_connector_state(myConnectorId, STATE_PAUSED);
 	if (result->status != SYNCHDB_BOOTSTRAP_COMPLETE)
 	{
-		char *message = psprintf("FDW bootstrap %s: %llu complete, %llu failed tables. No CDC handoff; inspect the structured result before a new bootstrap.",
+		char *message = psprintf("FDW bootstrap %s: %llu complete, %llu failed tables. Inspect the structured result before a new bootstrap.",
 			result->status == SYNCHDB_BOOTSTRAP_PARTIAL ? "PARTIAL" : "FAILED",
 			(unsigned long long) result->completed_tables, (unsigned long long) result->failed_tables);
+		/* Retain snapshot flags so a partial result cannot enter capture. */
+		set_shm_connector_state(myConnectorId, STATE_PAUSED);
 		set_shm_connector_errmsg(myConnectorId, message);
 		pfree(message);
 	}
+	else if (result->stop_after)
+	{
+		set_shm_connector_state(myConnectorId, STATE_PAUSED);
+		set_shm_connector_errmsg(myConnectorId, NULL);
+	}
 	else
-		set_shm_connector_errmsg(myConnectorId, result->stop_after ? NULL :
-			"Schema bootstrap completed. CDC handoff is unavailable; resume is blocked.");
+	{
+		if (!result->cdc_eligible || result->resume_material == NULL)
+			elog(ERROR, "completed FDW bootstrap has no CDC continuation material");
+		/* TODO: the frozen history and candidate offset enable legacy CDC
+		 * continuation, but do not establish a consistent FDW read boundary. */
+#ifdef WITH_OLR
+		if (connectorType == TYPE_OLR)
+			olr_handoff_complete_fdw(connInfo, result->resume_material);
+		else
+#endif
+			synchdb_java_prepare_fdw_handoff(&worker.java, connInfo, connectorType,
+				result->resume_material);
+		connInfo->flag &= ~(CONNFLAG_INITIAL_SNAPSHOT_MODE | CONNFLAG_SCHEMA_SYNC_MODE |
+			CONNFLAG_NO_CDC_MODE);
+		set_shm_connector_stage(myConnectorId, STAGE_CHANGE_DATA_CAPTURE);
+		set_shm_connector_errmsg(myConnectorId, NULL);
+		if (result->continue_cdc)
+			start_fdw_capture(connectorType, connInfo);
+		else
+			set_shm_connector_state(myConnectorId, STATE_PAUSED);
+	}
+	synchdb_registry_report_bootstrap(sdb_state, &worker.owner, (int) result->status + 1);
 	return 0;
 }
 
@@ -3060,7 +3167,8 @@ synchdb_engine_run(Datum main_arg)
 		case TYPE_ORACLE:
 		case TYPE_POSTGRES:
 		{
-			/* A local bootstrap needs neither a JVM nor offset/history files. */
+			/* Snapshot-only FDW remains local. Capture prepares a generation
+			 * and JVM before collecting the FDW continuation material. */
 			if (connInfo->snapengine == ENGINE_FDW)
 				synchdb_bootstrap_require_mode(snapshotMode,
 					(connInfo->flag & CONNFLAG_SCHEMA_SYNC_MODE) != 0);
@@ -3087,10 +3195,11 @@ synchdb_engine_run(Datum main_arg)
 
             if (connInfo->snapengine == ENGINE_FDW)
             {
-                synchdb_bootstrap_require_mode(snapshotMode,
-                    (connInfo->flag & CONNFLAG_SCHEMA_SYNC_MODE) != 0);
-                connInfo->flag |= CONNFLAG_INITIAL_SNAPSHOT_MODE | CONNFLAG_NO_CDC_MODE;
-                set_shm_connector_state(myConnectorId, STATE_SYNCING);
+                if (!start_snapshot_run(connectorType,connInfo,snapshotMode))
+                {
+                    completed=true;
+                    break;
+                }
                 completed = main_loop(run);
                 break;
             }

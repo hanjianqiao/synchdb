@@ -1,4 +1,4 @@
-/* Exact, persistent local engine artifact ownership. No FDW seed is created. */
+/* Exact, persistent local engine ownership, including explicit FDW seeds. */
 #include "postgres.h"
 #include "fmgr.h"
 
@@ -421,12 +421,12 @@ artifact_new_generation(pg_uuid_t *generation)
 
 static void
 artifact_insert(const char *catalog, const ConnectionInfo *connection,
-				const SynchdbArtifactPaths *paths, Jsonb *identity, bool legacy)
+				const SynchdbArtifactPaths *paths, Jsonb *identity, const char *origin)
 {
 	Oid types[] = {OIDOID, UUIDOID, UUIDOID, INT8OID, JSONBOID, TEXTOID};
 	Datum values[] = {ObjectIdGetDatum(MyDatabaseId), UUIDPGetDatum(&connection->key.connector_id),
 		UUIDPGetDatum(&paths->generation), Int64GetDatum(connection->config_revision),
-		JsonbPGetDatum(identity), CStringGetTextDatum(legacy ? "LEGACY_COPY" : "NATIVE")};
+		JsonbPGetDatum(identity), CStringGetTextDatum(origin)};
 	char *query = psprintf("INSERT INTO %s (database_oid,connector_id,generation,config_revision,source_identity,phase,active,origin) "
 		"VALUES ($1,$2,$3,$4,$5,'ENGINE_OWNED',true,$6)", catalog);
 
@@ -451,6 +451,11 @@ artifact_resume_metadata(SynchdbArtifactPaths *paths, HeapTuple tuple,
 	int length;
 
 	paths->resume_existing = true;
+	if (origin && strcmp(origin, "FDW_SEED") == 0)
+	{
+		paths->fdw_seed = true;
+		return;
+	}
 	if (origin && strcmp(origin, "NATIVE") == 0)
 		return;
 	if (!origin || strcmp(origin, "LEGACY_COPY") != 0)
@@ -514,9 +519,9 @@ synchdb_artifact_store_lookup(const SynchdbConnectorKey *key, SynchdbArtifactPat
 	return found;
 }
 
-void
-synchdb_artifact_store_prepare(const ConnectionInfo *connection, ConnectorType type,
-							   SynchdbArtifactPaths *out)
+static void
+artifact_store_prepare(const ConnectionInfo *connection, ConnectorType type,
+					   SynchdbArtifactPaths *out, bool fdw_seed)
 {
 	MemoryContext caller = CurrentMemoryContext;
 	Oid types[] = {OIDOID, UUIDOID, JSONBOID};
@@ -567,9 +572,15 @@ synchdb_artifact_store_prepare(const ConnectionInfo *connection, ConnectorType t
 								errhint("Stop the connector and explicitly reset its artifact generation before selecting a new snapshot.")));
 			synchdb_artifact_paths(&connection->key, &generation, out);
 			artifact_resume_metadata(out, SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3, 4);
-			artifact_regular(out->offset, true);
-			if (type != TYPE_POSTGRES)
-				artifact_regular(out->history, true);
+			/* FDW OLR resumes from its transactional cursor, without a Java
+			 * producer offset. SQL Server may be stopped after schema sync and
+			 * before recovery has built its connector-specific history. */
+			if (!(type == TYPE_OLR && out->fdw_seed))
+			{
+				artifact_regular(out->offset, true);
+				if (type != TYPE_POSTGRES)
+					artifact_regular(out->history, !(type == TYPE_SQLSERVER && out->fdw_seed));
+			}
 			artifact_selections(connection, out, identity, false);
 		}
 		else
@@ -582,7 +593,8 @@ synchdb_artifact_store_prepare(const ConnectionInfo *connection, ConnectorType t
 			synchdb_artifact_paths(&connection->key, &generation, out);
 			artifact_require_fresh(out);
 			artifact_selections(connection, out, identity, true);
-			artifact_insert(catalog, connection, out, identity, false);
+			out->fdw_seed = fdw_seed;
+			artifact_insert(catalog, connection, out, identity, fdw_seed ? "FDW_SEED" : "NATIVE");
 		}
 		synchdb_store_finish();
 		PopActiveSnapshot();
@@ -597,6 +609,25 @@ synchdb_artifact_store_prepare(const ConnectionInfo *connection, ConnectorType t
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+}
+
+void
+synchdb_artifact_store_prepare(const ConnectionInfo *connection, ConnectorType type,
+							   SynchdbArtifactPaths *out)
+{
+	artifact_store_prepare(connection, type, out,
+		type == TYPE_OLR && connection->snapengine == ENGINE_FDW);
+}
+
+void
+synchdb_artifact_store_prepare_fdw(const ConnectionInfo *connection, ConnectorType type,
+								 SynchdbArtifactPaths *out)
+{
+	artifact_store_prepare(connection, type, out, true);
+	if (out->resume_existing)
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("FDW bootstrap cannot overwrite an existing artifact generation"),
+						errhint("Resume the existing generation, or stop and explicitly reset it.")));
 }
 
 Datum
@@ -769,7 +800,7 @@ synchdb_artifact_migrate_legacy(PG_FUNCTION_ARGS)
 	if (artifact_regular(history, type != TYPE_POSTGRES))
 		artifact_copy(history, paths.history);
 	artifact_selections(&connection, &paths, identity, true);
-	artifact_insert(catalog, &connection, &paths, identity, true);
+	artifact_insert(catalog, &connection, &paths, identity, "LEGACY_COPY");
 	MemoryContextSwitchTo(caller);
 	result = palloc(sizeof(*result));
 	*result = generation;

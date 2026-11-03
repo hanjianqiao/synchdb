@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS synchdb_artifacts (
     source_identity pg_catalog.jsonb NOT NULL CHECK (pg_catalog.jsonb_typeof(source_identity) = 'object'),
     phase pg_catalog.text NOT NULL CHECK (phase IN ('ENGINE_OWNED','PURGE_REQUESTED','PURGING','PURGE_FAILED','PURGED')),
     active pg_catalog.bool NOT NULL,
-    origin pg_catalog.text NOT NULL CHECK (origin IN ('NATIVE','LEGACY_COPY')),
+    origin pg_catalog.text NOT NULL CHECK (origin IN ('NATIVE','LEGACY_COPY','FDW_SEED')),
     format_version pg_catalog.int4 NOT NULL DEFAULT 1 CHECK (format_version = 1),
     created_at pg_catalog.timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
     updated_at pg_catalog.timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),

@@ -83,9 +83,12 @@ synchdb_source_consistency_validate_run(const SynchdbRunSpec *spec)
 	if (spec->snapshot_provider == SYNCHDB_SNAPSHOT_FDW)
 	{
 		if (!(spec->connection.flag & CONNFLAG_SCHEMA_SYNC_MODE) &&
-			strcmp(mode, "initial_only") != 0)
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							errmsg("FDW source reads do not establish a verified CDC handoff")));
+			strcmp(mode, "initial_only") != 0 && strcmp(mode, "initial") != 0 &&
+			strcmp(mode, "always") != 0 && strcmp(mode, "no_data") != 0 && strcmp(mode, "never") != 0)
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("unsupported FDW snapshot mode: %s", mode)));
+		/* TODO: restore the provider-specific read-view/CDC fence.  Permit
+		 * legacy FDW continuation while reporting handoff_verified=false. */
 		return;
 	}
 	if (spec->snapshot_provider != SYNCHDB_SNAPSHOT_DEBEZIUM)
@@ -140,7 +143,7 @@ synchdb_source_consistency_describe(const SynchdbRunSpec *spec, MemoryContext co
 	appendStringInfoString(&json, ",\"mode\":");
 	escape_json(&json, schema_only ? "no_data" : spec->snapshot_mode);
 	appendStringInfoString(&json, ",\"protocol\":");
-	escape_json(&json, !native ? "FDW_BOOTSTRAP_ONLY_V1" :
+	escape_json(&json, !native ? "UNVERIFIED_FDW_CDC_HANDOFF_V1" :
 		(spec->capture_backend == SYNCHDB_CAPTURE_OLR ?
 		 "ORACLE_OLR_SOURCE_FENCE_SNAPSHOT_V1" : protocol->native_protocol));
 	appendStringInfoString(&json, ",\"read_view\":");

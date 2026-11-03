@@ -75,6 +75,7 @@ DECLARE
   v_binlog_file  text;       -- mysql
   v_binlog_pos   bigint;     -- mysql
   v_ts_sec       bigint;     -- mysql
+  v_history_schema name;
 BEGIN
 
   IF p_offset IS NOT NULL AND btrim(p_offset) <> '' THEN
@@ -87,16 +88,20 @@ BEGIN
   -- Prepare per-connector schema-history table (if requested)
   ----------------------------------------------------------------------
   IF p_write_dbz_schema_info THEN
-    v_schema_tbl :=
+    -- The frozen bootstrap keeps history inside its exact resource manifest.
+    -- The compatibility wrapper retains the historical public-table location.
+    v_history_schema := CASE WHEN p_record_attributes THEN 'public'::name ELSE p_stage_schema END;
+    v_schema_tbl := CASE WHEN p_record_attributes THEN
       format('schema_history_%s',
-             regexp_replace(lower(p_connector_name::text), '[^a-z0-9_]', '_', 'g'));
+             regexp_replace(lower(p_connector_name::text), '[^a-z0-9_]', '_', 'g'))
+      ELSE 'schema_history' END;
 
     -- single-column table: line TEXT
     EXECUTE format(
       'CREATE TABLE IF NOT EXISTS %I.%I (
          line  text NOT NULL
        )',
-      'public', v_schema_tbl
+      v_history_schema, v_schema_tbl
     );
 
     -- truncate at start so each run produces a clean set
@@ -868,7 +873,7 @@ BEGIN
       -- store one JSON line per table
       EXECUTE format(
         'INSERT INTO %I.%I(line) VALUES ($1)',
-        'public', v_schema_tbl
+        v_history_schema, v_schema_tbl
       )
       USING v_msg_json::text;
     END IF;
