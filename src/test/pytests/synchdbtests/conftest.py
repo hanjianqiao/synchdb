@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 import time
 import shutil
 import psycopg2
@@ -313,8 +314,27 @@ def setup_remote_instance(source: Source, request):
     env["OLRVER"]   = source.version or ""
     env["INTERNAL"] = "1" if source.internal else "0"
 
-    subprocess.run(["bash", "./ci/setup-remotedbs.sh"],
-                   check=True, env=env, stdout=subprocess.DEVNULL)
+    # Source preparation can fail before target_instance creates its data
+    # directory. Keep this log outside that directory so initdb/cleanup cannot
+    # remove it, and CI can upload it even when this fixture never yields.
+    log_dir = "source-setup-logs"
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, source.key + ".log")
+    try:
+        with open(log_path, "wb") as log:
+            subprocess.run(["bash", "./ci/setup-remotedbs.sh"],
+                           check=True, env=env, stdout=log,
+                           stderr=subprocess.STDOUT)
+    except subprocess.CalledProcessError:
+        print(f"Source setup failed; full log: {log_path}", file=sys.stderr)
+        try:
+            with open(log_path, "rb") as log:
+                log.seek(max(0, os.fstat(log.fileno()).st_size - 64 * 1024))
+                tail = log.read().decode("utf-8", errors="replace").splitlines()[-120:]
+            print("\n".join(tail), file=sys.stderr)
+        except OSError as error:
+            print(f"Could not read source setup log: {error}", file=sys.stderr)
+        raise
     yield
     if request.session.testsfailed and os.environ.get("SYNCHDB_KEEP_FAILED_SOURCE") == "1":
         print(f"test failed: source container kept at {source.container}")

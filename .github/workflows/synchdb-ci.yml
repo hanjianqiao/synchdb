@@ -256,6 +256,11 @@ jobs:
         name: synchdb-test-outputs-${{ matrix.source }}-pg${{ matrix.major }}
         path: |-
           ./synchdb_testdir
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: synchdb-source-setup-${{ matrix.source }}-pg${{ matrix.major }}
+        path: ./source-setup-logs
 
   # ----------------------------------------------------------- test (IvorySQL 4)
   # Decoupled from the PG test job so a flaky IvorySQL build never blocks PG CI.
@@ -348,3 +353,8 @@ jobs:
         name: synchdb-test-outputs-${{ matrix.source }}-ivorysql${{ matrix.major }}
         path: |-
           ./synchdb_testdir
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: synchdb-source-setup-${{ matrix.source }}-ivorysql${{ matrix.major }}
+        path: ./source-setup-logs

@@ -18,37 +18,50 @@ else
   exit 1
 fi
 
+function container_readiness_failed()
+{
+	local name=$1
+	local reason=$2
+
+	echo "$reason" >&2
+	echo "Container state for $name:" >&2
+	docker inspect --format '{{json .State}}' "$name" >&2 || true
+	echo "Last 100 log lines for $name:" >&2
+	docker logs --tail 100 "$name" >&2 || true
+	# Some setup functions call this with errexit disabled. Do not continue
+	# configuring the source database after a failed readiness check.
+	exit 1
+}
+
 function wait_for_container_ready()
 {
-	name=$1
-	keyword=$2
-	ready=0
-
-	set +e
-	if ! docker inspect $name >/dev/null 2>&1; then
-		echo "$name is not running or failed to start!"
-		return
-	fi	
+	local name=$1
+	local keyword=$2
+	local state status exit_code oom_killed started_at i
 
 	for ((i=1; i<=MAX_TRIES; i++));
 	do
-		docker logs "$name" 2>&1 | grep "$keyword"
-		if [ $? -eq 0 ]; then
-		#if docker logs "$name" 2>/dev/null | grep "$keyword"; then
-			echo "$name is ready to use"
-			ready=1
-			break
-		else
-			echo "Still waiting for $name to become ready..."
-			sleep 10
+		if ! state=$(docker inspect --format '{{.State.Status}} {{.State.ExitCode}} {{.State.OOMKilled}} {{.State.StartedAt}}' "$name"); then
+			container_readiness_failed "$name" "$name is missing or its state could not be inspected."
 		fi
+		read -r status exit_code oom_killed started_at <<< "$state"
+		if [[ "$oom_killed" == true || "$status" == exited || "$status" == dead || "$status" == removing ]]; then
+			container_readiness_failed "$name" "$name stopped before becoming ready (state=$status, exit_code=$exit_code, OOMKilled=$oom_killed)."
+		fi
+
+		# Ignore readiness messages left by an earlier container start.
+		if [[ "$status" == running ]] && docker logs --since "$started_at" "$name" 2>&1 | grep -F -- "$keyword"; then
+			echo "$name is ready to use"
+			# Preserve the existing contract: source configuration after a
+			# successful wait must stop on errors, including after a restart.
+			set -e
+			return 0
+		fi
+		echo "Still waiting for $name to become ready..."
+		sleep 10
 	done
 
-	if [ $ready -ne 1 ]; then
-		echo "giving up after $MAX_TRIES on $name..."
-		exit 1
-	fi
-	set -e
+	container_readiness_failed "$name" "giving up after $MAX_TRIES attempts on $name..."
 }
 
 function setup_mysql()
