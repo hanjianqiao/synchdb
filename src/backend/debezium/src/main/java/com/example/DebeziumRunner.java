@@ -92,6 +92,7 @@ public class DebeziumRunner {
 		private String database;
 		private String table;
 		private String snapshotMode;
+		private boolean schemaSync;
 
 		/* extended parameters - set incrementally */
 		private int batchSize;
@@ -152,6 +153,11 @@ public class DebeziumRunner {
 				"pg_synchdb/[1-9][0-9]*_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"))
 				throw new IllegalArgumentException("Artifact identity must be an ASCII database/connector/generation path");
 			this.artifactBase = artifactBase;
+			return this;
+		}
+		public MyParameters setSchemaSync(boolean schemaSync)
+		{
+			this.schemaSync = schemaSync;
 			return this;
 		}
 		public MyParameters setArtifactResume(boolean resumeExisting)
@@ -788,7 +794,12 @@ public class DebeziumRunner {
 			SourceConsistency.configure(props, myParameters.connectorType, myParameters.artifactFdwHandoff);
 			NativeSourcePreflight.requireArtifactState(props, myParameters.artifactResume);
 			if (myParameters.connectorType == TYPE_POSTGRES)
+			{
 				NativeSourcePreflight.validatePostgres(props, myParameters.artifactResume);
+				if (myParameters.schemaSync)
+					NativeSourcePreflight.preparePostgresSchemaSync(props, myParameters.artifactResume);
+				PostgresSchemaSync.configure(props, myParameters.schemaSync);
+			}
 			SnapshotCompletion snapshotCompletion = SnapshotCompletion.configure(props,activeArtifactBase,batches);
 			final OlrSnapshotBoundary olrBoundary = myParameters.connectorType == TYPE_OPENLOG_REPLICATOR
 				? new OlrSnapshotBoundary() : null;

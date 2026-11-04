@@ -42,6 +42,7 @@
 #include "utils/snapmgr.h"
 #include "executor/pg_compat.h"
 #include "converter/rule_snapshot.h"
+#include "converter/mapping_reload.h"
 #include "source/debezium_schema.h"
 #include "access/htup_details.h"
 #include <time.h>
@@ -2490,7 +2491,8 @@ fc_load_objmap(const char *name, ConnectorType type)
                                 ALLOCSET_DEFAULT_SIZES);
  PG_TRY();
  {
-  /* Read rules only: no target binding and no target DDL during reload. */
+  /* Compile first, then migrate only this connector's bound target objects.
+   * Both target DDL and the candidate must succeed before rules are published. */
   StartTransactionCommand();
   PushActiveSnapshot(GetTransactionSnapshot());
   synchdb_mapping_store_list_raw(name, &objects, &count, scratch);
@@ -2499,6 +2501,9 @@ fc_load_objmap(const char *name, ConnectorType type)
    * independent run-owned candidate survives that transaction. */
   MemoryContextSwitchTo(caller);
   candidate = synchdb_rule_snapshot_build(name, type, objects, count, converterRuleContext);
+  MemoryContextSwitchTo(scratch);
+  synchdb_mapping_reload_targets(name, type, objects, count);
+  MemoryContextSwitchTo(caller);
   PopActiveSnapshot();
   CommitTransactionCommand();
   MemoryContextSwitchTo(caller);

@@ -6,7 +6,6 @@ from common import run_pg_query, run_pg_query_one, run_remote_query, create_sync
 
 import pytest
 from psycopg2 import sql
-from psycopg2.errors import FeatureNotSupported
 
 
 def wait_for_connector_cdc(cursor, name, timeout=180, interval=2):
@@ -36,6 +35,117 @@ def wait_for_pg_row(cursor, query, timeout=60, interval=1):
             return row
         time.sleep(interval)
     pytest.fail(f"row did not arrive within {timeout}s: {query}")
+
+
+def _wait_for_rows(cursor, name, query, expected, timeout=120):
+    deadline = time.monotonic() + timeout
+    while True:
+        rows = run_pg_query(cursor, query)
+        if rows == expected:
+            return
+        cursor.execute("SELECT actual_state,last_error FROM synchdb_control_view WHERE name=%s", (name,))
+        state = cursor.fetchone()
+        assert state and state[0] not in ("FAILED", "RETRY_WAIT", "STOPPED"), state
+        assert time.monotonic() < deadline, (query, rows, expected, state)
+        time.sleep(0.1)
+
+
+def _assert_sqlserver_snapshot_continues_cdc(cursor, name, schema):
+    # TODO: add a coordinated capture-drain fence test. This preserves the
+    # legacy initial/always continuation, without claiming a consistent
+    # boundary while SQL Server's asynchronous capture job has a backlog.
+    wait_for_connector_cdc(cursor, name)
+    table = sql.Identifier(schema, "orders").as_string(cursor.connection)
+    probe_id = None
+    try:
+        run_remote_query("sqlserver", """
+            INSERT INTO orders(order_date,purchaser,quantity,product_id)
+            VALUES ('2025-12-12',1002,18005001,102)
+        """)
+        probe = run_remote_query("sqlserver", "SELECT max(order_number) FROM orders WHERE quantity=18005001")
+        probe_id = int(probe[0][0])
+        query = f"SELECT order_number,purchaser,quantity,product_id FROM {table} WHERE order_number={probe_id}"
+        _wait_for_rows(cursor, name, query, [(probe_id, 1002, 18005001, 102)])
+        run_remote_query("sqlserver", f"UPDATE orders SET quantity=18005002 WHERE order_number={probe_id}")
+        _wait_for_rows(cursor, name, query, [(probe_id, 1002, 18005002, 102)])
+        run_remote_query("sqlserver", f"DELETE FROM orders WHERE order_number={probe_id}")
+        _wait_for_rows(cursor, name, query, [])
+        assert run_pg_query_one(cursor, f"SELECT count(*) FROM {table}") == (4,)
+    finally:
+        if probe_id is not None:
+            run_remote_query("sqlserver", f"DELETE FROM orders WHERE order_number={probe_id}")
+
+
+def _postgres_prebuilt_schema_sync(cursor, name, schema):
+    # Native PostgreSQL schemasync retains the old contract: the user builds
+    # the target beforehand. It initializes no_data capture, then pauses;
+    # automatic source-schema import is provided by the FDW path instead.
+    table = sql.Identifier(schema, "orders").as_string(cursor.connection)
+    cursor.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(schema)))
+    cursor.execute(sql.SQL("""CREATE TABLE {}(order_number int PRIMARY KEY,
+        order_date timestamp without time zone,purchaser int,quantity int,product_id int)""").format(
+            sql.Identifier(schema, "orders")))
+    cursor.execute("SELECT %s::regclass::oid", (table,))
+    target_oid = cursor.fetchone()[0]
+
+    def paused():
+        deadline = time.monotonic() + 180
+        while True:
+            cursor.execute("SELECT actual_state,last_sqlstate,last_error FROM synchdb_control_view WHERE name=%s", (name,))
+            state = cursor.fetchone()
+            assert state and state[0] not in ("FAILED", "RETRY_WAIT", "STOPPED"), state
+            assert state[1] in (None, "00000"), state
+            if state[0] == "PAUSED":
+                return
+            assert time.monotonic() < deadline, f"idle PG source did not finish schema-only initialization: {state}"
+            time.sleep(0.1)
+
+    def generation():
+        cursor.execute("""SELECT a.generation::text FROM synchdb_artifacts a
+            JOIN synchdb_conninfo c USING(connector_id) WHERE c.name=%s AND a.active""", (name,))
+        rows = cursor.fetchall()
+        assert len(rows) == 1, rows
+        return rows[0][0]
+
+    try:
+        result = create_and_start_synchdb_connector(cursor, "postgres", name, "schemasync")
+        assert result > 0
+        # Do not generate a source event to make this transition happen.
+        paused()
+        assert run_pg_query_one(cursor, f"SELECT count(*) FROM {table}") == (0,)
+        original_generation = generation()
+        slot = "synchdb_" + original_generation.replace("-", "") + "_slot"
+        assert run_remote_query("postgres", f"SELECT slot_name FROM pg_replication_slots WHERE slot_name='{slot}'") == [(slot,)]
+
+        for source_id, quantity in ((10005, 10000), (10006, 10001)):
+            if source_id == 10006:
+                cursor.execute("SELECT synchdb_stop_engine_bgw(%s)", (name,))
+                wait_for_operation(cursor, cursor.fetchone()[0])
+                cursor.execute("SELECT synchdb_start_engine_bgw(%s,'schemasync')", (name,))
+                wait_for_operation(cursor, cursor.fetchone()[0])
+                paused()
+                assert generation() == original_generation
+                assert run_pg_query(cursor, f"SELECT order_number,quantity FROM {table} ORDER BY order_number") == [(10005, 10000)]
+            run_remote_query("postgres", f"""INSERT INTO orders(order_number,order_date,purchaser,quantity,product_id)
+                VALUES ({source_id},'2025-12-12',1002,{quantity},102)""")
+            # The new source row must stay unapplied until explicit RESUME.
+            assert run_pg_query_one(cursor, f"SELECT count(*) FROM {table} WHERE order_number={source_id}") == (0,)
+            cursor.execute("SELECT synchdb_resume_engine(%s)", (name,))
+            wait_for_operation(cursor, cursor.fetchone()[0])
+            wait_for_connector_cdc(cursor, name)
+            expected = [(10005, 10000)] if source_id == 10005 else [(10005, 10000), (10006, 10001)]
+            _wait_for_rows(cursor, name, f"SELECT order_number,quantity FROM {table} ORDER BY order_number", expected)
+            assert generation() == original_generation
+            cursor.execute("SELECT %s::regclass::oid", (table,))
+            assert cursor.fetchone()[0] == target_oid
+            assert run_remote_query("postgres", f"SELECT slot_name FROM pg_replication_slots WHERE slot_name='{slot}'") == [(slot,)]
+    finally:
+        cursor.execute("SELECT 1 FROM synchdb_conninfo WHERE name=%s", (name,))
+        if cursor.fetchone():
+            stop_and_delete_synchdb_connector(cursor, name)
+            drop_repslot_and_pub("postgres", name, "postgres")
+        drop_default_pg_schema(cursor, "postgres")
+        run_remote_query("postgres", "DELETE FROM orders WHERE order_number IN (10005,10006)")
 
 
 def test_ConnectorCreate(pg_cursor, dbvendor):
@@ -112,22 +222,11 @@ def test_ConnectorStart(pg_cursor, dbvendor):
     result = create_synchdb_connector(pg_cursor, dbvendor, name)
     assert result[0] == 0
 
-    if dbvendor == "sqlserver":
-        # The default initial mode must fail before an artifact is acquired.
-        with pytest.raises(FeatureNotSupported, match="capture-drain fence"):
-            run_pg_query_one(pg_cursor, f"SELECT synchdb_start_engine_bgw('{name}')")
-        pg_cursor.execute("""
-            SELECT count(*) FROM synchdb_artifacts a
-            JOIN synchdb_conninfo c USING (connector_id) WHERE c.name = %s
-        """, (name,))
-        assert pg_cursor.fetchone()[0] == 0
-        row = run_pg_query_one(pg_cursor, f"SELECT synchdb_start_engine_bgw('{name}', 'no_data')")
-    else:
-        row = run_pg_query_one(pg_cursor, f"SELECT synchdb_start_engine_bgw('{name}')")
+    row = run_pg_query_one(pg_cursor, f"SELECT synchdb_start_engine_bgw('{name}')")
     wait_for_operation(pg_cursor, row[0])
 
     # oracle takes longer to start initial snapshot
-    if dbvendor in ("oracle", "oracle23ai"):
+    if dbvendor in ("oracle", "oracle23ai", "sqlserver"):
         common.wait_for_native_snapshot(pg_cursor, name)
     elif dbvendor == "olr":
         time.sleep(20)
@@ -160,8 +259,7 @@ def test_InitialSnapshotDBZ(pg_cursor, dbvendor):
         run_pg_query_one(pg_cursor, f"CREATE SCHEMA IF NOT EXISTS {dbname}")
         run_pg_query_one(pg_cursor, f"CREATE TABLE {dbname}.orders (order_number int primary key, order_date timestamp without time zone, purchaser int, quantity int , product_id int)")
 
-    mode = "initial_only" if dbvendor == "sqlserver" else "initial"
-    result = create_and_start_synchdb_connector(pg_cursor, dbvendor, name, mode)
+    result = create_and_start_synchdb_connector(pg_cursor, dbvendor, name, "initial")
     assert result > 0
 
     if dbvendor in ("oracle", "oracle23ai", "olr"):
@@ -170,7 +268,7 @@ def test_InitialSnapshotDBZ(pg_cursor, dbvendor):
         time.sleep(10)
 
     if dbvendor == "sqlserver":
-        common.wait_for_snapshot_only(pg_cursor, name)
+        common.wait_for_native_snapshot(pg_cursor, name)
 
     # check table counts
     pgtblcount = run_pg_query_one(pg_cursor, f"SELECT count(*) FROM information_schema.tables where table_schema='{dbname}' and table_type = 'BASE TABLE'")
@@ -233,6 +331,9 @@ def test_InitialSnapshotDBZ(pg_cursor, dbvendor):
     assert int(pgrow[2]) == int(extrow[0][2])
     assert int(pgrow[3]) == int(extrow[0][3])
     assert int(pgrow[4]) == int(extrow[0][4])
+
+    if dbvendor == "sqlserver":
+        _assert_sqlserver_snapshot_continues_cdc(pg_cursor, name, dbname)
 
     stop_and_delete_synchdb_connector(pg_cursor, name)
     drop_default_pg_schema(pg_cursor, dbvendor)
@@ -511,8 +612,7 @@ def test_InitialSnapshotDBZ_uppercase(pg_cursor, dbvendor):
         run_pg_query_one(pg_cursor, f"CREATE SCHEMA IF NOT EXISTS \"{dbname}\"")
         run_pg_query_one(pg_cursor, f"CREATE TABLE \"{dbname}\".\"ORDERS\" (\"ORDER_NUMBER\" int primary key, \"ORDER_DATE\" timestamp without time zone, \"PURCHASER\" int, \"QUANTITY\" int , \"PRODUCT_ID\" int)")
 
-    mode = "initial_only" if dbvendor == "sqlserver" else "initial"
-    result = create_and_start_synchdb_connector(pg_cursor, dbvendor, name, mode)
+    result = create_and_start_synchdb_connector(pg_cursor, dbvendor, name, "initial")
     assert result > 0
 
     if dbvendor in ("oracle", "oracle23ai", "olr"):
@@ -521,7 +621,7 @@ def test_InitialSnapshotDBZ_uppercase(pg_cursor, dbvendor):
         time.sleep(10)
 
     if dbvendor == "sqlserver":
-        common.wait_for_snapshot_only(pg_cursor, name)
+        common.wait_for_native_snapshot(pg_cursor, name)
 
     # check table counts
     pgtblcount = run_pg_query_one(pg_cursor, f"SELECT count(*) FROM information_schema.tables where table_schema='{dbname}' and table_type = 'BASE TABLE'")
@@ -587,15 +687,7 @@ def test_InitialSnapshotDBZ_uppercase(pg_cursor, dbvendor):
     assert int(pgrow[4]) == int(extrow[0][4])
 
     if dbvendor == "sqlserver":
-        # Discard the snapshot and start an independent CDC-only generation.
-        # This test does not assert a snapshot-to-CDC handoff.
-        stop_and_delete_synchdb_connector(pg_cursor, name)
-        drop_default_pg_schema(pg_cursor, dbvendor)
-        name += "_cdc"
-        create_and_start_synchdb_connector(pg_cursor, dbvendor, name, "no_data")
         wait_for_connector_cdc(pg_cursor, name)
-        wait_for_pg_row(pg_cursor, f"SELECT 1 FROM pg_tables WHERE schemaname = '{dbname}' AND tablename = 'ORDERS'")
-        assert run_pg_query_one(pg_cursor, f'SELECT count(*) FROM "{dbname}"."ORDERS"') == (0,)
 
     # test cdc now
     if dbvendor == "mysql":
@@ -658,8 +750,7 @@ def test_InitialSnapshotDBZ_asis(pg_cursor, dbvendor):
 
     update_guc_conf(pg_cursor, "synchdb.letter_casing_strategy", "'asis'", True)
 
-    mode = "initial_only" if dbvendor == "sqlserver" else "initial"
-    result = create_and_start_synchdb_connector(pg_cursor, dbvendor, name, mode)
+    result = create_and_start_synchdb_connector(pg_cursor, dbvendor, name, "initial")
     assert result > 0
 
     if dbvendor in ("oracle", "oracle23ai", "olr"):
@@ -668,7 +759,7 @@ def test_InitialSnapshotDBZ_asis(pg_cursor, dbvendor):
         time.sleep(10)
 
     if dbvendor == "sqlserver":
-        common.wait_for_snapshot_only(pg_cursor, name)
+        common.wait_for_native_snapshot(pg_cursor, name)
 
     # check table counts
     pgtblcount = run_pg_query_one(pg_cursor, f"SELECT count(*) FROM information_schema.tables where table_schema='{dbname}' and table_type = 'BASE TABLE'")
@@ -740,15 +831,7 @@ def test_InitialSnapshotDBZ_asis(pg_cursor, dbvendor):
     assert int(pgrow[4]) == int(extrow[0][4])
 
     if dbvendor == "sqlserver":
-        # Discard the snapshot and start an independent CDC-only generation.
-        # This test does not assert a snapshot-to-CDC handoff.
-        stop_and_delete_synchdb_connector(pg_cursor, name)
-        drop_default_pg_schema(pg_cursor, dbvendor)
-        name += "_cdc"
-        create_and_start_synchdb_connector(pg_cursor, dbvendor, name, "no_data")
         wait_for_connector_cdc(pg_cursor, name)
-        wait_for_pg_row(pg_cursor, f"SELECT 1 FROM pg_tables WHERE schemaname = '{dbname}' AND tablename = 'orders'")
-        assert run_pg_query_one(pg_cursor, f'SELECT count(*) FROM "{dbname}".orders') == (0,)
 
     # test cdc now
     if dbvendor == "mysql":
@@ -803,10 +886,7 @@ def test_ConnectorStartSchemaSyncModeDBZ(pg_cursor, dbvendor):
     schema = getSchema(dbvendor)
 
     if dbvendor == "postgres":
-        create_synchdb_connector(pg_cursor, dbvendor, name)
-        with pytest.raises(FeatureNotSupported, match="automatic schema sync"):
-            pg_cursor.execute("SELECT synchdb_start_engine_bgw(%s, 'schemasync')", (name,))
-        stop_and_delete_synchdb_connector(pg_cursor, name)
+        _postgres_prebuilt_schema_sync(pg_cursor, name, dbname)
         return
 
     result = create_and_start_synchdb_connector(pg_cursor, dbvendor, name, "schemasync")
@@ -933,18 +1013,6 @@ def test_ConnectorStartAlwaysModeDBZ(pg_cursor, dbvendor):
     dbname = getDbname(dbvendor).lower()
     schema = getSchema(dbvendor)
 
-    if dbvendor == "sqlserver":
-        create_synchdb_connector(pg_cursor, dbvendor, name)
-        with pytest.raises(FeatureNotSupported, match="capture-drain fence"):
-            pg_cursor.execute("SELECT synchdb_start_engine_bgw(%s, 'always')", (name,))
-        pg_cursor.execute("""
-            SELECT count(*) FROM synchdb_artifacts a
-            JOIN synchdb_conninfo c USING (connector_id) WHERE c.name = %s
-        """, (name,))
-        assert pg_cursor.fetchone()[0] == 0
-        stop_and_delete_synchdb_connector(pg_cursor, name)
-        return
-
     if dbvendor == "postgres":
         # postgres in debezium snapshot needs to create tables manually
         run_pg_query_one(pg_cursor, f"CREATE SCHEMA IF NOT EXISTS {dbname}")
@@ -953,7 +1021,9 @@ def test_ConnectorStartAlwaysModeDBZ(pg_cursor, dbvendor):
     result = create_and_start_synchdb_connector(pg_cursor, dbvendor, name, "always")
     assert result > 0
 
-    if dbvendor in ("oracle", "oracle23ai", "olr"):
+    if dbvendor == "sqlserver":
+        common.wait_for_native_snapshot(pg_cursor, name)
+    elif dbvendor in ("oracle", "oracle23ai", "olr"):
         time.sleep(30)
     else:
         time.sleep(10)
@@ -1016,6 +1086,9 @@ def test_ConnectorStartAlwaysModeDBZ(pg_cursor, dbvendor):
     assert row[3] == "initial snapshot" or row[3] == "change data capture"
     assert row[4] == "polling"
     assert row[5] == "no error"
+
+    if dbvendor == "sqlserver":
+        _assert_sqlserver_snapshot_continues_cdc(pg_cursor, name, dbname)
 
     stop_and_delete_synchdb_connector(pg_cursor, name)
     drop_default_pg_schema(pg_cursor, dbvendor)

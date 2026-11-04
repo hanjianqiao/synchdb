@@ -16,15 +16,19 @@ import java.nio.file.Path;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-/* Native PG ownership is independent of a display alias. Catalog checks are
- * read-only, precede engine construction, and do not manufacture a CDC seed.
+/* Native PG ownership is independent of a display alias. Catalog checks
+ * precede engine construction and do not manufacture a CDC seed. The explicit
+ * schema-only preparation below creates the generation's source objects before
+ * a finite producer takes its own native LSN; ordinary preflight is read-only.
  * A generation that dies before persisting its first offset requires explicit
  * recovery/reset. Neither a dangling slot nor an empty file is a fresh start.
  * Source administrators must preserve exclusive use of the owned names: PG
@@ -180,6 +184,64 @@ final class NativeSourcePreflight
                 validatePublicationTables(source, config);
             }
         }
+    }
+
+    static void preparePostgresSchemaSync(Properties properties, boolean resumeExisting) throws SQLException
+    {
+        if (resumeExisting)
+            // validatePostgres has already required the exact existing objects
+            // and checked them against the persisted engine offset. Never
+            // recreate an absent slot: doing so would discard paused writes.
+            return;
+        PostgresConnectorConfig config = new PostgresConnectorConfig(Configuration.from(properties));
+        try (PostgresConnection source = new PostgresConnection(config.getJdbcConfig(), "synchdb-pg-schema-sync"))
+        {
+            source.connection().setAutoCommit(true);
+            String command = "CREATE PUBLICATION " + quote(config.publicationName());
+            if ("all_tables".equals(properties.getProperty("publication.autocreate.mode", "all_tables")))
+                command += " FOR ALL TABLES";
+            else
+            {
+                List<String> tables = new ArrayList<>();
+                try (PreparedStatement query = prepare(source,
+                    "SELECT n.nspname,c.relname FROM pg_catalog.pg_class c "
+                    + "JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace "
+                    + "WHERE c.relkind='r' AND c.relpersistence<>'t'"); ResultSet rows = query.executeQuery())
+                {
+                    while (rows.next())
+                    {
+                        TableId table = new TableId(null, rows.getString(1), rows.getString(2));
+                        if (config.getTableFilters().dataCollectionFilter().isIncluded(table))
+                            tables.add(quote(table.schema()) + "." + quote(table.table()));
+                    }
+                }
+                if (!tables.isEmpty())
+                    command += " FOR TABLE " + String.join(",", tables);
+            }
+            try (PreparedStatement create = prepare(source, command))
+            {
+                create.execute();
+            }
+            // Debezium initial_only does not create a replication slot because
+            // shouldStream=false. Create the same generation-owned slot before
+            // the zero-data snapshot captures its LSN, so all writes during
+            // PAUSED remain available when RESUME opens ordinary no_data CDC.
+            try (PreparedStatement create = prepare(source,
+                "SELECT slot_name FROM pg_catalog.pg_create_logical_replication_slot(?,'pgoutput')"))
+            {
+                create.setString(1, config.slotName());
+                try (ResultSet row = create.executeQuery())
+                {
+                    if (!row.next() || !config.slotName().equals(row.getString(1)))
+                        throw new IllegalStateException("PostgreSQL schema-sync source slot was not created");
+                }
+            }
+        }
+    }
+
+    private static String quote(String identifier)
+    {
+        return "\"" + identifier.replace("\"", "\"\"") + "\"";
     }
 
     private static void validatePublicationTables(PostgresConnection source, PostgresConnectorConfig config) throws SQLException

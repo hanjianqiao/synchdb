@@ -174,6 +174,7 @@ java_set_extra_parameters(JNIEnv *env, jclass cls, jobject parameters,
 	const char *ssl_values[] = {extra->ssl_mode, extra->ssl_keystore,
 		extra->ssl_keystore_pass, extra->ssl_truststore, extra->ssl_truststore_pass};
 	jvalue boolean_argument = {.z = options->dbz_capture_only_selected_table_ddl ? JNI_TRUE : JNI_FALSE};
+	jvalue schema_sync = {.z = (connection->flag & CONNFLAG_SCHEMA_SYNC_MODE) ? JNI_TRUE : JNI_FALSE};
 	int index;
 
 	if (!java_set_integer(env, cls, parameters, "setBatchSize", options->dbz_batch_size) ||
@@ -188,7 +189,9 @@ java_set_extra_parameters(JNIEnv *env, jclass cls, jobject parameters,
 		!java_set_string(env, cls, parameters, "setIncrementalSnapshotWatermarkingStrategy", options->dbz_incremental_snapshot_watermarking_strategy) ||
 		!java_set_integer(env, cls, parameters, "setOffsetFlushIntervalMs", options->dbz_offset_flush_interval_ms) ||
 		!java_set_parameter(env, cls, parameters, "setCaptureOnlySelectedTableDDL",
-							"(Z)" PARAMETERS_RESULT, &boolean_argument))
+							"(Z)" PARAMETERS_RESULT, &boolean_argument) ||
+		!java_set_parameter(env, cls, parameters, "setSchemaSync",
+							"(Z)" PARAMETERS_RESULT, &schema_sync))
 		return false;
 
 	for (index = 0; index < (int) lengthof(ssl_names); index++)

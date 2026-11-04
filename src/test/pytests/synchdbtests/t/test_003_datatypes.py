@@ -1131,29 +1131,95 @@ def test_ReloadObjmapEntries(pg_cursor, dbvendor):
         rows = run_pg_query_one(pg_cursor, f"SELECT synchdb_add_objmap('{name}', 'transform', '{exttable_prefix}.orders.order_number', '%d + 1000000')")
         assert rows[0] == 0
 
-    # Reload changes rules at a batch boundary; target DDL is an explicit
-    # operator action. Pause while migrating the existing target to those rules.
+    # RELOAD must migrate the existing target and activate its rules together.
+    # A bad type conversion must leave both the old target and old rules usable.
     rows = run_pg_query_one(pg_cursor, f"SELECT synchdb_pause_engine('{name}')")
     common.wait_for_operation(pg_cursor, rows[0])
+    target = f"{dbname.lower()}.orders"
+    original_oid = run_pg_query_one(pg_cursor, f"SELECT '{target}'::regclass::oid")[0]
+    original_attributes = run_pg_query(pg_cursor, f"""
+        SELECT attnum, attname, atttypid, atttypmod
+        FROM pg_attribute WHERE attrelid = {original_oid}
+          AND attnum > 0 AND NOT attisdropped ORDER BY attnum
+    """)
+    original_rows = run_pg_query(pg_cursor, f"""
+        SELECT order_number::bigint, order_date::text, purchaser::bigint,
+               quantity::text, product_id FROM {target} ORDER BY order_number
+    """)
+    assert original_rows
+    original_pid = run_pg_query_one(pg_cursor, f"SELECT pid FROM synchdb_state_view WHERE name = '{name}'")[0]
+    source_date = (f"{exttable_prefix}.ORDERS.ORDER_DATE"
+                   if dbvendor in ("oracle", "oracle23ai", "olr")
+                   else f"{exttable_prefix}.orders.order_date")
+    pg_cursor.execute("SELECT synchdb_add_objmap(%s, 'datatype', %s::text, 'integer'::text)",
+                      (name, source_date))
+    assert pg_cursor.fetchone()[0] == 0
     rows = run_pg_query_one(pg_cursor, f"SELECT synchdb_reload_objmap('{name}')")
-    common.wait_for_operation(pg_cursor, rows[0])
+    failure = common.wait_for_operation(pg_cursor, rows[0], expected_status="FAILED")
+    assert failure["sqlstate"] in ("42804", "42846", "22P02"), failure
     rows = run_pg_query_one(pg_cursor, f"""
         SELECT to_regclass('{dbname.lower()}.orders') IS NOT NULL,
                to_regclass('{dbname.lower()}.invoices') IS NULL
     """)
     assert rows == (True, True)
-    run_pg_query(pg_cursor, f"ALTER TABLE {dbname.lower()}.orders RENAME TO invoices")
-    run_pg_query(pg_cursor, f"ALTER TABLE {dbname.lower()}.invoices RENAME COLUMN order_number TO the_number")
-    run_pg_query(pg_cursor, f"ALTER TABLE {dbname.lower()}.invoices RENAME COLUMN order_date TO the_date")
-    run_pg_query(pg_cursor, f"""
-        ALTER TABLE {dbname.lower()}.invoices
-          ALTER COLUMN purchaser TYPE bigint USING purchaser::bigint,
-          ALTER COLUMN quantity TYPE text USING quantity::text,
-          ALTER COLUMN the_number TYPE bigint USING the_number::bigint,
-          ALTER COLUMN the_date TYPE text USING the_date::text
+    assert run_pg_query(pg_cursor, f"""
+        SELECT attnum, attname, atttypid, atttypmod
+        FROM pg_attribute WHERE attrelid = {original_oid}
+          AND attnum > 0 AND NOT attisdropped ORDER BY attnum
+    """) == original_attributes
+    assert run_pg_query(pg_cursor, f"""
+        SELECT order_number::bigint, order_date::text, purchaser::bigint,
+               quantity::text, product_id FROM {target} ORDER BY order_number
+    """) == original_rows
+    assert run_pg_query_one(pg_cursor, f"SELECT pid FROM synchdb_state_view WHERE name = '{name}'")[0] == original_pid
+
+    # Prove the rejected rename/type/transform candidate was not activated:
+    # a new source UPDATE must still reach the original table and column names.
+    probe_id = original_rows[0][0]
+    original_quantity = original_rows[0][3]
+    probe_quantity = int(original_quantity) + 700000
+    rows = run_pg_query_one(pg_cursor, f"SELECT synchdb_resume_engine('{name}')")
+    common.wait_for_operation(pg_cursor, rows[0])
+    run_remote_query(dbvendor, f"UPDATE orders SET quantity = {probe_quantity} WHERE order_number = {probe_id}")
+    deadline = time.monotonic() + 120
+    while run_pg_query_one(pg_cursor, f"SELECT quantity FROM {target} WHERE order_number = {probe_id}")[0] != probe_quantity:
+        state = run_pg_query_one(pg_cursor, f"SELECT actual_state, last_error FROM synchdb_control_view WHERE name = '{name}'")
+        assert state[0] != "FAILED", state
+        assert time.monotonic() < deadline, "CDC did not continue with the previous rules after a failed RELOAD"
+        time.sleep(0.1)
+    rows = run_pg_query_one(pg_cursor, f"SELECT synchdb_pause_engine('{name}')")
+    common.wait_for_operation(pg_cursor, rows[0])
+    expected_rows = run_pg_query(pg_cursor, f"""
+        SELECT order_number::bigint, order_date::text, purchaser::bigint,
+               quantity::text, product_id FROM {target} ORDER BY order_number
     """)
+    pg_cursor.execute("SELECT synchdb_add_objmap(%s, 'datatype', %s::text, 'text|0'::text)",
+                      (name, source_date))
+    assert pg_cursor.fetchone()[0] == 0
     rows = run_pg_query_one(pg_cursor, f"SELECT synchdb_reload_objmap('{name}')")
     common.wait_for_operation(pg_cursor, rows[0])
+    mapped_target = f"{dbname.lower()}.invoices"
+    assert run_pg_query_one(pg_cursor, f"SELECT '{mapped_target}'::regclass::oid")[0] == original_oid
+    assert run_pg_query_one(pg_cursor, f"SELECT to_regclass('{target}') IS NULL")[0]
+    attributes = run_pg_query(pg_cursor, f"""
+        SELECT attnum, attname, format_type(atttypid, atttypmod)
+        FROM pg_attribute WHERE attrelid = {original_oid}
+          AND attnum > 0 AND NOT attisdropped ORDER BY attnum
+    """)
+    assert [(row[0], row[1]) for row in attributes] == [
+        (row[0], {"order_number": "the_number", "order_date": "the_date"}.get(row[1], row[1]))
+        for row in original_attributes]
+    types = {row[1]: row[2] for row in attributes}
+    assert types["the_number"] == types["purchaser"] == "bigint"
+    assert types["the_date"] == types["quantity"] == "text"
+    assert run_pg_query(pg_cursor, f"""
+        SELECT the_number, the_date, purchaser, quantity, product_id
+        FROM {mapped_target} ORDER BY the_number
+    """) == expected_rows
+    # Repeating the same reload must not rename twice or rebuild the target.
+    rows = run_pg_query_one(pg_cursor, f"SELECT synchdb_reload_objmap('{name}')")
+    common.wait_for_operation(pg_cursor, rows[0])
+    assert run_pg_query_one(pg_cursor, f"SELECT '{mapped_target}'::regclass::oid")[0] == original_oid
     rows = run_pg_query_one(pg_cursor, f"SELECT synchdb_resume_engine('{name}')")
     common.wait_for_operation(pg_cursor, rows[0])
     if dbvendor in ("oracle", "oracle23ai", "olr"):
@@ -1235,6 +1301,7 @@ def test_ReloadObjmapEntries(pg_cursor, dbvendor):
     drop_repslot_and_pub(dbvendor, name, "postgres")
 
     run_remote_query(dbvendor, f"DELETE FROM orders WHERE order_number>=10005")
+    run_remote_query(dbvendor, f"UPDATE orders SET quantity = {int(original_quantity)} WHERE order_number = {probe_id}")
     time.sleep(5)
     
 def test_TransformExpressionWithError(pg_cursor, dbvendor):

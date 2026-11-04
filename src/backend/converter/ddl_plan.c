@@ -687,16 +687,16 @@ ddl_prepare_table(SynchdbDdlPlan *plan, DdlTable *table)
 
 	table->old_bindings = synchdb_attribute_store_list_source_table(plan->connector,
 			plan->connector_type, source_key, plan->context);
-	/* A reload changes routing, not ownership of an existing target. In
-	 * particular, DROP must not delete the newly mapped table while forgetting
-	 * a source binding that still belongs to another physical relation. */
+	/* RELOAD can rename or move a bound target, but preserves its relation OID.
+	 * Routing must not replace that physical identity: in particular, DROP must
+	 * not delete a newly mapped table while leaving the original binding. */
 	foreach(cell, table->old_bindings)
 	{
 		const SynchdbAttributeBinding *binding = lfirst(cell);
 
 		if (binding->source_type && binding->target_relation != table->relation_oid)
 			ddl_unsupported(table->source->id.key,
-				"persisted source bindings belong to a different physical target; rule reload does not migrate target structure");
+				"persisted source bindings belong to a different physical target; use RELOAD to rename or move the bound target instead of replacing it");
 	}
 	if (OidIsValid(table->relation_oid))
 	{

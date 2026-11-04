@@ -32,6 +32,9 @@ extern List *synchdb_attribute_store_list_source_table(const char *name,
 		const char *type, const char *source_table, MemoryContext result_context);
 extern List *synchdb_attribute_store_list_target_relation(const char *name,
 		const char *type, Oid relation, MemoryContext result_context);
+/* All physical bindings belonging to one connector/type, ordered by OID. */
+extern List *synchdb_attribute_store_list_connector(const char *name,
+		const char *type, MemoryContext result_context);
 extern uint64 synchdb_attribute_store_delete_source_table(const char *name,
 														 const char *type,
 														 const char *source_table);

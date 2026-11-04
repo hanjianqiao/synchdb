@@ -84,7 +84,7 @@ attribute_store_list(const char *name, const char *type,
 	attribute_store_scope(name, type);
 	if (source_table)
 		attribute_store_source(source_table, "source_table");
-	else
+	else if (OidIsValid(target_relation))
 	{
 		attribute_store_target(target_relation, 1);
 		argtypes[2] = OIDOID;
@@ -99,13 +99,14 @@ attribute_store_list(const char *name, const char *type,
 		"AND type::pg_catalog.text OPERATOR(pg_catalog.=) $2 "
 		"AND %s ORDER BY attrelid,attnum", relation,
 		source_table ? "ext_tbname::pg_catalog.text COLLATE pg_catalog.\"C\" OPERATOR(pg_catalog.=) $3" :
-		"attrelid OPERATOR(pg_catalog.=) $3");
+		(OidIsValid(target_relation) ? "attrelid OPERATOR(pg_catalog.=) $3" : "true"));
 	values[0] = CStringGetTextDatum(name);
 	values[1] = CStringGetTextDatum(attribute_store_type(type));
 	values[2] = source_table ? CStringGetTextDatum(source_table) : ObjectIdGetDatum(target_relation);
 	/* A batch's entry snapshot predates bindings written by an earlier schema
 	 * event. A current command snapshot is required even though this is SELECT. */
-	if (SPI_execute_with_args(query, 3, argtypes, values, NULL, false, 0) != SPI_OK_SELECT)
+	if (SPI_execute_with_args(query, source_table || OidIsValid(target_relation) ? 3 : 2,
+			argtypes, values, NULL, false, 0) != SPI_OK_SELECT)
 		elog(ERROR, "could not read source-table attribute bindings");
 	for (i = 0; i < SPI_processed; i++)
 	{
@@ -154,7 +155,15 @@ List *
 synchdb_attribute_store_list_target_relation(const char *name, const char *type,
 										   Oid relation, MemoryContext result_context)
 {
+	attribute_store_target(relation, 1);
 	return attribute_store_list(name, type, NULL, relation, result_context);
+}
+
+List *
+synchdb_attribute_store_list_connector(const char *name, const char *type,
+									 MemoryContext result_context)
+{
+	return attribute_store_list(name, type, NULL, InvalidOid, result_context);
 }
 
 void

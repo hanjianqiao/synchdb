@@ -83,6 +83,7 @@ OBJS = src/backend/synchdb/synchdb.o \
        src/backend/converter/value_codec.o \
        src/backend/converter/transform_expression.o \
        src/backend/converter/rule_snapshot.o \
+       src/backend/converter/mapping_reload.o \
        src/backend/converter/ddl_plan.o \
        src/backend/converter/debezium_event_handler.o \
        src/backend/executor/replication_agent.o \

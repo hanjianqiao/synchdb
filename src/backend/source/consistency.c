@@ -34,7 +34,7 @@ static const SourceProtocol protocols[] =
 	 "{\"snapshot.locking.mode\":\"shared\",\"internal.log.mining.transaction.snapshot.boundary.mode\":\"all\","
 	 "\"log.mining.transaction.retention.ms\":\"0\",\"log.mining.buffer.transaction.events.threshold\":\"0\","
 	 "\"log.mining.window.max.ms\":\"0\",\"snapshot.database.errors.max.retries\":\"0\"}"},
-	{"sqlserver", "DEBEZIUM_SQLSERVER_SNAPSHOT_ONLY_CDC_HANDOFF_UNIMPLEMENTED_V1", "UNCOORDINATED_FDW_READ",
+	{"sqlserver", "DEBEZIUM_SQLSERVER_UNVERIFIED_SNAPSHOT_CDC_HANDOFF_V1", "UNCOORDINATED_FDW_READ",
 	 "[\"CDC enabled on database and captured tables\",\"SQL Server Agent/capture and cleanup jobs configured\","
 	 "\"SELECT/CDC privileges and captured-table exclusive locks\",\"capture lag and CDC retention monitored\","
 	 "\"captured-table writes quiesced and CDC capture fully drained before starting the snapshot\","
@@ -104,11 +104,10 @@ synchdb_source_consistency_validate_run(const SynchdbRunSpec *spec)
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("native source consistency requires one snapshot thread"),
 						errhint("Set synchdb.dbz_snapshot_thread_num to 1; a shared read view across additional JDBC connections has not been established.")));
-	if (spec->source_dialect == SYNCHDB_SOURCE_SQLSERVER &&
-		(strcmp(mode, "initial") == 0 || strcmp(mode, "always") == 0))
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("SQL Server native snapshot-to-CDC has no implemented capture-drain fence"),
-						errhint("Use initial_only for a snapshot without CDC, or no_data for CDC without establishing a baseline. Exclusive snapshot locks alone do not synchronize the asynchronous CDC capture job.")));
+	/* TODO: coordinate SQL Server's snapshot with the asynchronous CDC capture
+	 * job. Retain legacy initial/always continuation while that fence is absent:
+	 * a row included in the snapshot can later be replayed from the capture job.
+	 * Exclusive table locks alone do not drain its existing capture backlog. */
 	if (spec->capture_backend == SYNCHDB_CAPTURE_OLR &&
 		strcmp(mode, "initial_only") != 0 &&
 		((strcmp(spec->connection.table, "null") != 0 && spec->connection.table[0] != '\0') ||
@@ -155,14 +154,13 @@ synchdb_source_consistency_describe(const SynchdbRunSpec *spec, MemoryContext co
 	if (spec->capture_backend == SYNCHDB_CAPTURE_OLR)
 		appendStringInfoString(&json, ",\"required_olr_settings\":{\"format.message\":2,\"format.schema\":7,\"format.scn-type\":3,\"flags.include\":4096},\"position_commit\":\"TARGET_TRANSACTION\"");
 	if (spec->source_dialect == SYNCHDB_SOURCE_SQLSERVER)
-		appendStringInfoString(&json, ",\"automatic_capture_drain_fence\":false,\"unsupported_native_modes\":[\"initial\",\"always\"]");
+		appendStringInfoString(&json, ",\"automatic_capture_drain_fence\":false,\"unsupported_native_modes\":[]");
 	appendStringInfo(&json,
 		",\"native_snapshot_to_cdc\":%s,\"external_handoff_supported\":false,"
 		"\"cdc_eligible\":false,\"handoff_verified\":false,\"prerequisites_verified\":false,"
 		"\"evidence_owner\":\"%s\",\"snapshot_threads\":%d,"
 		"\"external_retry_after_read_session_end\":\"RESTART_BOOTSTRAP\",\"prerequisites\":%s}",
 		native &&
-		spec->source_dialect != SYNCHDB_SOURCE_SQLSERVER &&
 		(strcmp(spec->snapshot_mode, "initial") == 0 || strcmp(spec->snapshot_mode, "always") == 0) ? "true" : "false",
 		native ? "NATIVE_ENGINE" : "NONE", native ? 1 : 0, protocol->prerequisites);
 	result = DatumGetJsonbP(DirectFunctionCall1(jsonb_in, CStringGetDatum(json.data)));

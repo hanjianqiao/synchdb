@@ -114,8 +114,6 @@ final class SourceConsistency
             throw new IllegalArgumentException("Unsupported native source consistency snapshot mode");
         if ("never".equals(mode) && connectorType != 1 && connectorType != 5)
             throw new IllegalArgumentException("This native connector does not support snapshot mode never");
-        if (!fdwHandoff && connectorType == 3 && ("initial".equals(mode) || "always".equals(mode)))
-            throw new IllegalArgumentException("SQL Server native snapshot-to-CDC requires an unimplemented capture-drain fence; use initial_only or explicit no_data");
         properties.setProperty("snapshot.mode", mode);
 
         if (fdwHandoff && connectorType == 3 && "recovery".equals(mode))
@@ -190,10 +188,10 @@ final class SourceConsistency
                 }
                 break;
             case 3:
-                // Exclusive keeps a snapshot-only read stable without relying
-                // on ALLOW_SNAPSHOT_ISOLATION. It cannot drain the asynchronous
-                // CDC job: initial/always handoff is rejected above, rather
-                // than turning a declared prerequisite into a false guarantee.
+                // TODO: coordinate the snapshot boundary with the asynchronous
+                // CDC capture job. Keep initial/always for legacy continuation:
+                // a snapshotted row can still be emitted by a lagging capture
+                // job. Exclusive locks stabilize the read but do not drain it.
                 require(properties, "snapshot.isolation.mode", "exclusive");
                 require(properties, "snapshot.locking.mode", "exclusive");
                 break;

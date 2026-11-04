@@ -57,4 +57,26 @@ public class SqlServerFdwRecoveryTest extends TestCase
         assertEquals(1, config.getDataCollectionsToBeSnapshotted().size());
         assertEquals("dbo.fdw_cdc_test", config.getDataCollectionsToBeSnapshotted().get(0));
     }
+
+    public void testNativeInitialAndAlwaysContinueToCdcWithTheKnownBoundaryGap()
+    {
+        for (String mode : new String[]{"initial", "always"})
+        {
+            Properties properties = selectedTable(mode);
+            // Native snapshots derive their complete baseline from the capture
+            // selection. The optional data-only subset uses another ID format.
+            properties.remove("snapshot.include.collection.list");
+            SourceConsistency.configure(properties, 3);
+            SqlServerConnectorConfig config = new SqlServerConnectorConfig(Configuration.from(properties));
+
+            assertEquals(mode, properties.getProperty("snapshot.mode"));
+            assertEquals("exclusive", properties.getProperty("snapshot.isolation.mode"));
+            assertEquals("exclusive", properties.getProperty("snapshot.locking.mode"));
+            assertEquals("1", properties.getProperty("snapshot.max.threads"));
+            assertTrue(config.getTableFilters().dataCollectionFilter().isIncluded(
+                new TableId("testDB", "dbo", "fdw_cdc_test")));
+            assertFalse(config.getTableFilters().dataCollectionFilter().isIncluded(
+                new TableId("testDB", "dbo", "unselected_table")));
+        }
+    }
 }

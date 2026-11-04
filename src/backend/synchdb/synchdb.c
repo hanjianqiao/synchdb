@@ -231,7 +231,6 @@ static void worker_sigterm(SIGNAL_ARGS);
 static void setup_environment(SynchdbWorkerRun *run);
 static void initialize_jvm(const JMXConnectionInfo *jmx, const SynchdbRunOptions *options);
 static void start_debezium_engine(ConnectorType connectorType, const ConnectionInfo *connInfo, const char * snapshotMode);
-static void validate_schema_sync_request(ConnectorType type, int snapshotEngine, int flag);
 static bool start_snapshot_run(ConnectorType type, ConnectionInfo *connInfo, const char *snapshotMode);
 static bool main_loop(SynchdbWorkerRun *run);
 static bool cleanup(ConnectorType connectorType);
@@ -1418,17 +1417,6 @@ start_debezium_engine(ConnectorType connectorType, const ConnectionInfo *connInf
 		 connInfo->hostname, connInfo->port, connectorType);
 }
 
-static void
-validate_schema_sync_request(ConnectorType type, int snapshotEngine, int flag)
-{
-	if (type == TYPE_POSTGRES && snapshotEngine == ENGINE_DEBEZIUM &&
-		(flag & CONNFLAG_SCHEMA_SYNC_MODE))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("PostgreSQL Debezium connectors do not support automatic schema sync"),
-				 errhint("Use the FDW snapshot engine for schema sync.")));
-}
-
 /* A committed engine generation is the authority for stop/start continuation.
  * File presence alone must never turn an interrupted FDW bootstrap into CDC. */
 static bool
@@ -1488,8 +1476,6 @@ start_snapshot_run(ConnectorType type, ConnectionInfo *connInfo, const char *sna
 	connInfo->flag &= ~(CONNFLAG_NO_CDC_MODE | CONNFLAG_INITIAL_SNAPSHOT_MODE);
 	if (!strcasecmp(snapshotMode, "initial_only"))
 		connInfo->flag |= CONNFLAG_NO_CDC_MODE;
-
-	validate_schema_sync_request(type, connInfo->snapengine, connInfo->flag);
 
 	if (connInfo->snapengine == ENGINE_DEBEZIUM)
 	{
@@ -1765,6 +1751,25 @@ main_loop(SynchdbWorkerRun *run)
 
         if (dbzExitSignal)
         {
+			if (connectorType == TYPE_POSTGRES &&
+				connInfo->snapengine == ENGINE_DEBEZIUM &&
+				(connInfo->flag & CONNFLAG_SCHEMA_SYNC_MODE))
+			{
+				/* Native PG schemasync requires user-created target tables.
+				 * Its finite, zero-data producer has acknowledged the native
+				 * boundary and completed successfully even on an idle source.
+				 * Close it before exposing PAUSED; RESUME reuses its offset. */
+				if (dbz_engine_stop())
+					elog(ERROR, "could not close the completed PostgreSQL schema-sync producer");
+				connInfo->flag &= ~(CONNFLAG_INITIAL_SNAPSHOT_MODE |
+					CONNFLAG_SCHEMA_SYNC_MODE | CONNFLAG_NO_CDC_MODE);
+				set_shm_dbz_offset(myConnectorId);
+				set_shm_connector_stage(myConnectorId, STAGE_CHANGE_DATA_CAPTURE);
+				set_shm_connector_state(myConnectorId, STATE_PAUSED);
+				synchdb_registry_report_ready(sdb_state, &worker.owner, true);
+				dbzExitSignal = false;
+				continue;
+			}
 #ifdef WITH_OLR
             if (connectorType == TYPE_OLR && olr_handoff_active() &&
                 !(connInfo->flag & CONNFLAG_NO_CDC_MODE))

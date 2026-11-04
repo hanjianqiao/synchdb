@@ -187,13 +187,9 @@ synchdb_run_spec_init(SynchdbRunSpec *out, ConnectorType type,
 	if (pg_strcasecmp(spec.snapshot_mode, "initial_only") == 0)
 		spec.connection.flag |= CONNFLAG_NO_CDC_MODE;
 
-	if (spec.source_dialect == SYNCHDB_SOURCE_POSTGRES &&
-		spec.snapshot_provider == SYNCHDB_SNAPSHOT_DEBEZIUM &&
-		(spec.connection.flag & CONNFLAG_SCHEMA_SYNC_MODE))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("PostgreSQL Debezium connectors do not support automatic schema sync"),
-				 errhint("Use the FDW snapshot engine for schema sync.")));
+	/* PostgreSQL native schemasync preserves the legacy prebuilt-target
+	 * workflow. It initializes a source position and pauses; it does not
+	 * create the target schema or copy historical rows. */
 	synchdb_source_consistency_validate_run(&spec);
 	*out = spec;
 }
