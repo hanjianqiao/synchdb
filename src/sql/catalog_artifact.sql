@@ -47,7 +47,8 @@ $synchdb_artifact_catalog$;
 REVOKE ALL ON synchdb_artifacts FROM PUBLIC;
 
 -- The replay coordinate commits in the same WAL transaction as source data.
--- Zero snapshot_scn is PREPARED; positive snapshot_scn is CDC eligible.
+-- Zero snapshot_scn is PREPARED, except for explicitly imported legacy OLR
+-- cursors whose unverified baseline has no native snapshot boundary.
 CREATE TABLE synchdb_olr_positions (
     database_oid pg_catalog.oid NOT NULL,
     connector_id pg_catalog.uuid NOT NULL,
@@ -71,6 +72,9 @@ CREATE OR REPLACE FUNCTION synchdb_artifact_request_purge(pg_catalog.uuid) RETUR
 AS 'MODULE_PATHNAME','synchdb_artifact_request_purge' LANGUAGE C VOLATILE STRICT;
 CREATE OR REPLACE FUNCTION synchdb_artifact_migrate_legacy(pg_catalog.name) RETURNS pg_catalog.uuid
 AS 'MODULE_PATHNAME','synchdb_artifact_migrate_legacy' LANGUAGE C VOLATILE STRICT;
+CREATE OR REPLACE FUNCTION synchdb_artifact_migrate_legacy(pg_catalog.name,pg_catalog.jsonb) RETURNS pg_catalog.uuid
+AS 'MODULE_PATHNAME','synchdb_artifact_migrate_legacy' LANGUAGE C VOLATILE STRICT;
 REVOKE ALL ON FUNCTION synchdb_artifact_manifest(pg_catalog.uuid),
     synchdb_artifact_reset(pg_catalog.uuid),synchdb_artifact_request_purge(pg_catalog.uuid),
-    synchdb_artifact_migrate_legacy(pg_catalog.name) FROM PUBLIC;
+    synchdb_artifact_migrate_legacy(pg_catalog.name),
+    synchdb_artifact_migrate_legacy(pg_catalog.name,pg_catalog.jsonb) FROM PUBLIC;

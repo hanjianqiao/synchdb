@@ -4,6 +4,9 @@ MODULE_big = synchdb
 
 EXTENSION = synchdb
 DATA_built = synchdb--1.1.sql
+# The release bundle carries this generated, restricted upgrade edge. Install
+# it alongside the fresh-install SQL so ALTER EXTENSION needs no manual copy.
+DATA = migration/sql/synchdb--1.0--1.1.sql
 
 # Keep the original SQL definition order.  These are the sources for the
 # generated extension installation script; do not edit that script directly.
@@ -164,6 +167,14 @@ truncate-test-module: $(OBJS) $(DATA_built)
 	@test -n "$(TRUNCATE_TEST_MODULE)" || { echo 'Set TRUNCATE_TEST_MODULE to a private output path'; exit 1; }
 	$(CC) $(CFLAGS) $(CPPFLAGS) -fPIC -c src/test/pytests/truncate/harness.c -o "$(TRUNCATE_TEST_MODULE).o"
 	$(CC) $(CFLAGS) -shared -o "$(TRUNCATE_TEST_MODULE)" "$(TRUNCATE_TEST_MODULE).o" $(filter-out src/backend/converter/rule_snapshot.o src/backend/converter/olr_event_handler.o,$(OBJS)) $(PG_LDFLAGS) $(LDFLAGS)
+
+# Test the real OLR framing/filter/cursor code with a private, source-free
+# catalog fixture. This module is never installed and adds no production SQL.
+.PHONY: olr-legacy-test-module
+olr-legacy-test-module: $(OBJS) $(DATA_built)
+	@test "$(WITH_OLR)" = 1 -a -n "$(OLR_LEGACY_TEST_MODULE)" || { echo 'Set WITH_OLR=1 and OLR_LEGACY_TEST_MODULE to a private output path'; exit 1; }
+	$(CC) $(CFLAGS) $(CPPFLAGS) -fPIC -c src/test/pytests/olr_legacy/harness.c -o "$(OLR_LEGACY_TEST_MODULE).o"
+	$(CC) $(CFLAGS) -shared -o "$(OLR_LEGACY_TEST_MODULE)" "$(OLR_LEGACY_TEST_MODULE).o" $(filter-out src/backend/olr/olr_client.o src/backend/olr/olr_handoff.o,$(OBJS)) $(PG_LDFLAGS) $(LDFLAGS)
 
 # Make does not track command-line compiler flag changes. Rebuild both native
 # and LLVM objects when switching OLR support, including an existing default

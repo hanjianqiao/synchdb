@@ -36,6 +36,18 @@ static uint64 g_start_sequence;
 static bool g_fresh_handoff;
 static uint64 g_maximum_start_scn;
 static uint64 g_source_boundary;
+static bool g_legacy_leading_fragment;
+
+static bool
+legacy_leading_fragment_allowed(Jsonb *proof)
+{
+	/* Once the new worker advances, its transactional cursor is at a complete
+	 * source boundary. Only the original imported position can be partial. */
+	return olr_handoff_legacy_resume() &&
+		olr_client_get_scn() == olr_json_uint(proof, "legacy_scn") &&
+		olr_client_get_c_scn() == olr_json_uint(proof, "legacy_c_scn") &&
+		olr_client_get_c_idx() == olr_json_uint(proof, "legacy_c_idx");
+}
 
 int
 olr_client_init(const char * hostname, unsigned int port)
@@ -187,6 +199,7 @@ complete_prefix(void)
     int offset = 0;
     int safe = 0;
     bool transaction = false;
+    bool leading_fragment = g_legacy_leading_fragment;
     uint64 commit_scn = 0;
 
     while (offset + 4 <= g_strinfo.len)
@@ -211,13 +224,25 @@ complete_prefix(void)
             if (transaction) elog(ERROR, "nested OLR source transaction");
             transaction = true;
             commit_scn = scn;
+            leading_fragment = false;
         }
         else if (!strcmp(op, "chkpt"))
         {
             if (transaction) elog(ERROR, "OLR checkpoint split a source transaction");
+            leading_fragment = false;
         }
         else
         {
+            /* Old workers committed arbitrary complete TCP frames. A cleanly
+             * stopped legacy cursor may therefore lie after BEGIN but before
+             * COMMIT. Finish just that first transaction without reapplying
+             * its already committed prefix; subsequent transactions are full. */
+            if (!transaction && leading_fragment)
+            {
+                transaction = true;
+                commit_scn = scn;
+                leading_fragment = false;
+            }
             if (!transaction || scn != commit_scn)
                 elog(ERROR, "OLR handoff requires transaction commit SCN on every payload (format.scn-type=3)");
             if (!strcmp(op, "commit")) transaction = false;
@@ -247,6 +272,7 @@ olr_client_verified_connect(const ConnectionInfo *connection, Jsonb *proof, bool
     g_start_scn = olr_json_uint(proof, "start_scn");
     g_start_sequence = olr_json_uint(proof, "redo_sequence");
     g_fresh_handoff = !resume;
+    g_legacy_leading_fragment = resume && legacy_leading_fragment_allowed(proof);
     g_maximum_start_scn = olr_json_uint(proof, resume ? "olr_first_data_scn" : "maximum_start_scn");
     olr_client_shutdown();
     if (olr_client_init(connection->olr.olr_host, connection->olr.olr_port))
@@ -380,6 +406,7 @@ olr_client_get_change(int connector_id, bool *exit_signal, SynchdbStatistics *st
     olr_handoff_store_position();
     PopActiveSnapshot();
     CommitTransactionCommand();
+    g_legacy_leading_fragment = false;
     }
     PG_CATCH();
     {

@@ -110,6 +110,10 @@ synchdb_source_consistency_validate_run(const SynchdbRunSpec *spec)
 	 * Exclusive table locks alone do not drain its existing capture backlog. */
 	if (spec->capture_backend == SYNCHDB_CAPTURE_OLR &&
 		strcmp(mode, "initial_only") != 0 &&
+		/* A no_data request may resume an imported legacy subset. Keep this
+		 * validator catalog-free; the OLR worker checks the actual generation
+		 * and its persisted protocol before permitting that continuation. */
+		strcmp(mode, "no_data") != 0 &&
 		((strcmp(spec->connection.table, "null") != 0 && spec->connection.table[0] != '\0') ||
 		 (strcmp(spec->connection.snapshottable, "null") != 0 && spec->connection.snapshottable[0] != '\0')))
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

@@ -23,19 +23,35 @@ static uint64 snapshot_scn;
 static bool active;
 
 #define OLR_FDW_PROTOCOL "UNVERIFIED_FDW_CDC_HANDOFF_V1"
+#define OLR_LEGACY_PROTOCOL "UNVERIFIED_LEGACY_OLR_CDC_V1"
 
-static bool
-fdw_compatibility_proof(Jsonb *proof)
+static const char *
+compatibility_protocol(Jsonb *proof)
 {
 	JsonbValue buffer;
 	JsonbValue *value;
 
 	if (!proof || !JB_ROOT_IS_OBJECT(proof))
-		return false;
+		return NULL;
 	value = getKeyJsonValueFromContainer(&proof->root, "protocol", 8, &buffer);
-	return value && value->type == jbvString &&
-		(Size) value->val.string.len == strlen(OLR_FDW_PROTOCOL) &&
-		memcmp(value->val.string.val, OLR_FDW_PROTOCOL, strlen(OLR_FDW_PROTOCOL)) == 0;
+	if (value && value->type == jbvString)
+	{
+		if ((Size) value->val.string.len == strlen(OLR_FDW_PROTOCOL) &&
+			memcmp(value->val.string.val, OLR_FDW_PROTOCOL, strlen(OLR_FDW_PROTOCOL)) == 0)
+			return OLR_FDW_PROTOCOL;
+		if ((Size) value->val.string.len == strlen(OLR_LEGACY_PROTOCOL) &&
+			memcmp(value->val.string.val, OLR_LEGACY_PROTOCOL, strlen(OLR_LEGACY_PROTOCOL)) == 0)
+			return OLR_LEGACY_PROTOCOL;
+	}
+	return NULL;
+}
+
+bool
+olr_handoff_legacy_resume(void)
+{
+	const char *protocol = compatibility_protocol(source_proof);
+
+	return protocol && strcmp(protocol, OLR_LEGACY_PROTOCOL) == 0;
 }
 
 char *
@@ -141,6 +157,7 @@ preflight(const ConnectionInfo *connection, SynchdbJavaRuntime *java)
 	Jsonb *proof;
 	MemoryContext caller;
 	int index;
+	const char *protocol = compatibility_protocol(source_proof);
 
 	initStringInfo(&request);
 	appendStringInfo(&request, "{\"port\":%u", connection->port);
@@ -151,6 +168,11 @@ preflight(const ConnectionInfo *connection, SynchdbJavaRuntime *java)
 	}
 	if (source_proof)
 		appendStringInfo(&request, ",\"previous\":%s", JsonbToCString(NULL, &source_proof->root, VARSIZE(source_proof)));
+	if (olr_handoff_legacy_resume())
+		appendStringInfo(&request, ",\"resume_scn\":\"%llu\",\"resume_c_scn\":\"%llu\",\"resume_c_idx\":\"%llu\"",
+			(unsigned long long) olr_client_get_scn(),
+			(unsigned long long) olr_client_get_c_scn(),
+			(unsigned long long) olr_client_get_c_idx());
 	appendStringInfoChar(&request, '}');
 	PG_TRY();
 	{
@@ -165,17 +187,18 @@ preflight(const ConnectionInfo *connection, SynchdbJavaRuntime *java)
 	PG_END_TRY();
 	caller = MemoryContextSwitchTo(TopMemoryContext);
 	proof = DatumGetJsonbP(DirectFunctionCall1(jsonb_in, CStringGetDatum(answer)));
-	if (fdw_compatibility_proof(source_proof))
+	if (protocol)
 	{
+		char *qualification = psprintf("{\"protocol\":\"%s\","
+			"\"handoff_verified\":false,\"cdc_verified\":false}", protocol);
 		Jsonb *marker = DatumGetJsonbP(DirectFunctionCall1(jsonb_in,
-			CStringGetDatum("{\"protocol\":\"" OLR_FDW_PROTOCOL "\","
-							"\"handoff_verified\":false,\"cdc_verified\":false}")));
+			CStringGetDatum(qualification)));
 		Jsonb *combined = DatumGetJsonbP(DirectFunctionCall2(jsonb_concat,
 			JsonbPGetDatum(proof), JsonbPGetDatum(marker)));
 
-		/* Java refreshes the real source identity and socket fence, but only
-		 * carries native snapshot fields forward. Keep the FDW qualification
-		 * across restart/reconnect; a new fence does not verify an old read. */
+		/* A new source fence cannot verify an old FDW read or legacy baseline.
+		 * Preserve that qualification across every restart/reconnect. */
+		pfree(qualification);
 		pfree(proof);
 		pfree(marker);
 		proof = combined;
@@ -223,12 +246,21 @@ olr_handoff_prepare(const ConnectionInfo *connection, SynchdbJavaRuntime *java)
 		source_proof = DatumGetJsonbPCopy(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
 		MemoryContextSwitchTo(caller);
 		snapshot_scn = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull));
-		if (!snapshot_scn)
+		if (!snapshot_scn && !olr_handoff_legacy_resume())
 			elog(ERROR, "OLR snapshot did not complete; explicit target/artifact recovery is required");
 		for (int index = 0; index < 3; index++)
 			values[index] = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3 + index, &isnull);
 		olr_client_set_scns(DatumGetInt64(values[0]), DatumGetInt64(values[1]), DatumGetInt64(values[2]));
 	}
+	/* no_data can mean continuing an imported old baseline, including its
+	 * original table subset. Only that committed legacy protocol is exempt
+	 * from the full-schema rule for a new native handoff. Check the actual
+	 * generation here rather than querying catalogs in pure run validation. */
+	if (connection->snapengine == ENGINE_DEBEZIUM && !(resume && olr_handoff_legacy_resume()) &&
+		((strcmp(connection->table, "null") != 0 && connection->table[0] != '\0') ||
+		 (strcmp(connection->snapshottable, "null") != 0 && connection->snapshottable[0] != '\0')))
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("verified native OLR handoff currently requires the complete configured schema")));
 	synchdb_store_end_path(level);
 	synchdb_store_finish();
 	PopActiveSnapshot();
@@ -247,6 +279,29 @@ olr_handoff_prepare(const ConnectionInfo *connection, SynchdbJavaRuntime *java)
 	}
 	active = true;
 	olr_client_verified_connect(connection, source_proof, resume);
+	if (resume && olr_handoff_legacy_resume())
+	{
+		Jsonb *verified = DatumGetJsonbP(DirectFunctionCall1(jsonb_in,
+			CStringGetDatum("{\"identity_verified\":true,\"legacy_source_identity_verified\":false}")));
+		Jsonb *combined;
+
+		/* Bind the freshly verified Oracle identity before applying any CDC.
+		 * It proves the source seen now, not the source behind an old file. */
+		caller = MemoryContextSwitchTo(TopMemoryContext);
+		combined = DatumGetJsonbP(DirectFunctionCall2(jsonb_concat,
+			JsonbPGetDatum(source_proof), JsonbPGetDatum(verified)));
+		pfree(source_proof);
+		source_proof = combined;
+		MemoryContextSwitchTo(caller);
+		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
+		store_state(false);
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+		elog(LOG, "OLR resumed imported legacy cursor %llu/%llu; legacy baseline consistency remains unverified",
+			(unsigned long long) olr_client_get_c_scn(),
+			(unsigned long long) olr_client_get_c_idx());
+	}
 	if (!resume)
 	{
 		char *position = psprintf("{\"olr_first_data_scn\":\"%llu\"}",
@@ -263,7 +318,7 @@ olr_handoff_prepare(const ConnectionInfo *connection, SynchdbJavaRuntime *java)
 void
 olr_handoff_reconnect(const ConnectionInfo *connection, SynchdbJavaRuntime *java)
 {
-	if (!active || !snapshot_scn)
+	if (!active || (!snapshot_scn && !olr_handoff_legacy_resume()))
 		elog(ERROR, "OLR reconnect requires a completed handoff");
 	source_proof = preflight(connection, java);
 	olr_client_verified_connect(connection, source_proof, true);
@@ -369,7 +424,7 @@ olr_handoff_active(void)
 void
 olr_handoff_store_position(void)
 {
-	if (!active || !snapshot_scn)
+	if (!active || (!snapshot_scn && !olr_handoff_legacy_resume()))
 		elog(ERROR, "OLR CDC cannot persist a cursor before its snapshot handoff");
 	store_state(false);
 }
@@ -391,7 +446,7 @@ olr_handoff_apply_record(Jsonb *record)
 		(unsigned long long) c_scn, (unsigned long long) c_idx,
 		(unsigned long long) olr_client_get_c_scn(), (unsigned long long) olr_client_get_c_idx());
 
-	if (!active || !snapshot_scn)
+	if (!active || (!snapshot_scn && !olr_handoff_legacy_resume()))
 		elog(ERROR, "OLR change received without a completed snapshot handoff");
 	if (c_scn < olr_client_get_c_scn() ||
 		(c_scn == olr_client_get_c_scn() && c_idx <= olr_client_get_c_idx()))
@@ -411,7 +466,11 @@ olr_handoff_apply_record(Jsonb *record)
 		if (pending_xids)
 			pending = DatumGetBool(DirectFunctionCall2(jsonb_exists, JsonbPGetDatum(pending_xids),
 				CStringGetTextDatum(olr_json_text(record, "xid"))));
-		apply = (scn > snapshot_scn || pending) && strcmp(owner, olr_json_text(source_proof, "owner")) == 0 &&
+		/* TODO: legacy snapshots did not establish the native read-view proof.
+		 * Continue strictly after the imported OLR coordinate; using its Oracle
+		 * SCN as a snapshot cutoff could discard later records at the same SCN. */
+		apply = (olr_handoff_legacy_resume() || scn > snapshot_scn || pending) &&
+			strcmp(owner, olr_json_text(source_proof, "owner")) == 0 &&
 			strcmp(table, "SYNCHDB_OLR_FENCE") != 0 && strncmp(table, "LOG_MINING", 10) != 0;
 	}
 	else if (!strcmp(op, "begin") || !strcmp(op, "commit"))

@@ -11,6 +11,8 @@ extern void olr_handoff_complete(const ConnectionInfo *connection, SynchdbJavaRu
 extern void olr_handoff_complete_fdw(const ConnectionInfo *connection, Jsonb *material);
 extern void olr_handoff_reconnect(const ConnectionInfo *connection, SynchdbJavaRuntime *java);
 extern bool olr_handoff_active(void);
+/* Old cursors may end inside a source transaction; no snapshot SCN is invented. */
+extern bool olr_handoff_legacy_resume(void);
 /* Caller owns the same transaction as the applied source rows. */
 extern void olr_handoff_store_position(void);
 extern bool olr_handoff_apply_record(Jsonb *record);

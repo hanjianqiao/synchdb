@@ -8,12 +8,14 @@
 #include <unistd.h>
 
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "catalog/catalog_access.h"
 #include "catalog/connector_store.h"
 #include "catalog/pg_authid_d.h"
 #include "catalog/pg_type_d.h"
 #include "common/file_perm.h"
 #include "executor/spi.h"
+#include "commands/dbcommands.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "runtime/run_registry.h"
@@ -34,10 +36,12 @@ PG_FUNCTION_INFO_V1(synchdb_artifact_request_purge);
 PG_FUNCTION_INFO_V1(synchdb_artifact_migrate_legacy);
 
 static void artifact_copy(const char *source, const char *destination);
+static void artifact_require_cache_layout(const char *path);
 
 typedef struct ArtifactCreatedFile
 {
 	char *path;
+	bool directory;
 	SubTransactionId subtransaction;
 	struct ArtifactCreatedFile *next;
 } ArtifactCreatedFile;
@@ -57,7 +61,7 @@ artifact_discard_created(ArtifactCreatedFile *file)
 {
 	/* Only O_EXCL-created, unpublished files enter this list. Abort cleanup
 	 * never traverses a directory or removes an existing engine generation. */
-	if (unlink(file->path) < 0 && errno != ENOENT)
+	if ((file->directory ? rmdir(file->path) : unlink(file->path)) < 0 && errno != ENOENT)
 		elog(WARNING, "could not remove unpublished artifact \"%s\": %m", file->path);
 }
 
@@ -392,7 +396,9 @@ artifact_legacy_prefix(ConnectorType type)
 		case TYPE_ORACLE: return "oracle";
 		case TYPE_SQLSERVER: return "sqlserver";
 		case TYPE_POSTGRES: return "postgres";
-		case TYPE_OLR: return "openlog_replicator_d";
+		/* The old C cursor and completion byte used olr_*. Java's
+		 * openlog_replicator_d_* files describe its separate snapshot engine. */
+		case TYPE_OLR: return "olr";
 		default: elog(ERROR, "unsupported artifact connector type");
 	}
 	return NULL;
@@ -408,6 +414,125 @@ artifact_legacy_path(const ConnectionInfo *connection, ConnectorType type, const
 						errmsg("legacy artifact alias contains a path separator")));
 	return psprintf("pg_synchdb/%s_%s_%s_%s.dat", artifact_legacy_prefix(type),
 		connection->name, connection->dstdb, suffix);
+}
+
+static void
+artifact_require_claim_result(const char *query, int count, Oid *types,
+							  Datum *values, const char *message)
+{
+	bool isnull;
+	Datum result;
+
+	if (SPI_execute_with_args(query, count, types, values, NULL, true, 1) != SPI_OK_SELECT || SPI_processed != 1)
+		elog(ERROR, "could not check legacy artifact ownership inventory");
+	result = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+	if (isnull || !DatumGetBool(result))
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg_internal("%s", message)));
+}
+
+/* Legacy names can contain underscores. Only another actual database suffix
+ * makes their split uncertain. An administrator can resolve that uncertainty
+ * with a complete cluster inventory; the automatic upgrader collects it from
+ * every database while all SynchDB writers are stopped. Never infer ownership
+ * by splitting at the first or last underscore. */
+static void
+artifact_require_legacy_owner(const ConnectionInfo *connection, ConnectorType type, Jsonb *claims)
+{
+	Oid types[] = {JSONBOID, TEXTOID, OIDOID, TEXTOID};
+	Datum values[4];
+	char system_identifier[32];
+	char *stem = psprintf("%s_%s", connection->name, connection->dstdb);
+	char *connectors;
+	char *query;
+	int level = synchdb_store_begin_path();
+
+	if (strcmp(connection->dstdb, get_database_name(MyDatabaseId)) != 0)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("legacy artifact destination does not match the current database")));
+	/* Validate aliases even when a caller supplies an ownership inventory. */
+	(void) artifact_legacy_path(connection, type, "offsets");
+	if (type == TYPE_POSTGRES &&
+		(strlen(stem) + strlen("_synchdb_slot") >= NAMEDATALEN ||
+		 strlen(stem) + strlen("_synchdb_pub") >= NAMEDATALEN))
+		ereport(ERROR, (errcode(ERRCODE_NAME_TOO_LONG),
+						errmsg("legacy PostgreSQL slot or publication identity exceeds the identifier limit")));
+	if (!claims)
+	{
+		Oid plain_types[] = {TEXTOID, TEXTOID};
+		Datum plain_values[] = {CStringGetTextDatum(connection->dstdb), CStringGetTextDatum(stem)};
+
+		artifact_require_claim_result(
+			"SELECT NOT EXISTS (SELECT 1 FROM pg_catalog.pg_database "
+			"WHERE datname<>$1 AND length($2)>length(datname)+1 "
+			"AND right($2,length(datname)+1)='_'||datname)",
+			2, plain_types, plain_values,
+			"legacy artifact filename has another possible database owner; supply a complete cluster ownership inventory");
+		synchdb_store_end_path(level);
+		return;
+	}
+	snprintf(system_identifier, sizeof(system_identifier), UINT64_FORMAT, GetSystemIdentifier());
+	values[0] = JsonbPGetDatum(claims);
+	values[1] = CStringGetTextDatum(system_identifier);
+	values[2] = ObjectIdGetDatum(MyDatabaseId);
+	values[3] = CStringGetTextDatum(artifact_legacy_path(connection, type, "offsets"));
+	artifact_require_claim_result(
+		"SELECT jsonb_typeof($1)='object' AND jsonb_typeof($1->'databases')='array' "
+		"AND jsonb_typeof($1->'system_identifier')='string' AND $1->>'system_identifier'=$2",
+		2, types, values, "legacy ownership inventory has an invalid format or belongs to another PostgreSQL cluster");
+	artifact_require_claim_result(
+		"WITH declared AS (SELECT * FROM jsonb_to_recordset($1->'databases') "
+		"AS d(oid oid,name text,connectors jsonb)), expected AS "
+		"(SELECT oid,datname::text AS name FROM pg_catalog.pg_database WHERE datallowconn AND NOT datistemplate) "
+		"SELECT NOT EXISTS (SELECT 1 FROM declared WHERE oid IS NULL OR name IS NULL "
+		"OR jsonb_typeof(connectors) IS DISTINCT FROM 'array') "
+		"AND (SELECT count(*)=count(DISTINCT oid) AND count(*)=count(DISTINCT name) FROM declared) "
+		"AND NOT EXISTS ((SELECT oid,name FROM expected EXCEPT SELECT oid,name FROM declared) "
+		"UNION ALL (SELECT oid,name FROM declared EXCEPT SELECT oid,name FROM expected))",
+		1, types, values, "legacy ownership inventory is incomplete or database names have changed");
+	artifact_require_claim_result(
+		"WITH declared AS (SELECT d.oid,c.* FROM jsonb_to_recordset($1->'databases') "
+		"AS d(oid oid,name text,connectors jsonb) CROSS JOIN LATERAL "
+		"jsonb_to_recordset(d.connectors) AS c(name text,connector text,target_database text)) "
+		"SELECT NOT EXISTS (SELECT 1 FROM declared WHERE name IS NULL OR name='' "
+		"OR connector IS NULL OR connector='' OR target_database IS NULL OR target_database='') "
+		"AND NOT EXISTS (SELECT 1 FROM declared GROUP BY oid,name HAVING count(*)<>1)",
+		1, types, values, "legacy ownership inventory contains malformed or duplicate connector claims");
+	/* The caller has audited the remote databases. Recheck the complete local
+	 * inventory against persistent rows rather than trusting its own claim. */
+	connectors = synchdb_store_relation("synchdb_conninfo", ShareLock);
+	query = psprintf(
+		"WITH declared AS (SELECT c.* FROM jsonb_to_recordset($1->'databases') "
+		"AS d(oid oid,name text,connectors jsonb) CROSS JOIN LATERAL "
+		"jsonb_to_recordset(d.connectors) AS c(name text,connector text,target_database text) WHERE d.oid=$3), "
+		"actual AS (SELECT name::text,lower(data->>'connector') AS connector,"
+		"coalesce(data->>'dstdb',current_database()) AS target_database FROM %s) "
+		"SELECT NOT EXISTS ((SELECT name,lower(connector),target_database FROM declared "
+		"EXCEPT SELECT * FROM actual) UNION ALL (SELECT * FROM actual EXCEPT "
+		"SELECT name,lower(connector),target_database FROM declared))", connectors);
+	artifact_require_claim_result(query, 3, types, values,
+		"legacy ownership inventory no longer matches this database's connector configuration");
+	/* Even an unavailable/template database can own an old suffix. A skipped
+	 * database cannot be certified as empty merely because it was not scanned. */
+	query = psprintf(
+		"WITH declared AS (SELECT * FROM jsonb_to_recordset($1->'databases') "
+		"AS d(oid oid,name text,connectors jsonb)) SELECT NOT EXISTS "
+		"(SELECT 1 FROM pg_catalog.pg_database d WHERE length(%s)>length(d.datname)+1 "
+		"AND right(%s,length(d.datname)+1)='_'||d.datname "
+		"AND NOT EXISTS (SELECT 1 FROM declared x WHERE x.oid=d.oid))",
+		quote_literal_cstr(stem), quote_literal_cstr(stem));
+	artifact_require_claim_result(query, 1, types, values,
+		"another possible legacy filename owner belongs to a database omitted from the ownership inventory");
+	artifact_require_claim_result(
+		"WITH declared AS (SELECT d.oid,c.* FROM jsonb_to_recordset($1->'databases') "
+		"AS d(oid oid,name text,connectors jsonb) CROSS JOIN LATERAL "
+		"jsonb_to_recordset(d.connectors) AS c(name text,connector text,target_database text)), "
+		"paths AS (SELECT oid,name,target_database,'pg_synchdb/'||CASE lower(connector) "
+		"WHEN 'mysql' THEN 'mysql' WHEN 'oracle' THEN 'oracle' WHEN 'sqlserver' THEN 'sqlserver' "
+		"WHEN 'postgres' THEN 'postgres' WHEN 'postgresql' THEN 'postgres' WHEN 'olr' THEN 'olr' END "
+		"||'_'||name||'_'||target_database||'_offsets.dat' AS path FROM declared) "
+		"SELECT count(*)=1 AND bool_and(oid=$3) FROM paths WHERE path=$4",
+		4, types, values, "multiple connector/database pairs claim the same legacy artifact filename");
+	synchdb_store_end_path(level);
 }
 
 static void
@@ -565,6 +690,7 @@ artifact_store_prepare(const ConnectionInfo *connection, ConnectorType type,
 		{
 			pg_uuid_t generation = *DatumGetUUIDP(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
 			bool compatible = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull));
+			char *origin = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3);
 
 			if (isnull || !compatible)
 				ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -572,15 +698,19 @@ artifact_store_prepare(const ConnectionInfo *connection, ConnectorType type,
 								errhint("Stop the connector and explicitly reset its artifact generation before selecting a new snapshot.")));
 			synchdb_artifact_paths(&connection->key, &generation, out);
 			artifact_resume_metadata(out, SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3, 4);
-			/* FDW OLR resumes from its transactional cursor, without a Java
-			 * producer offset. SQL Server may be stopped after schema sync and
-			 * before recovery has built its connector-specific history. */
-			if (!(type == TYPE_OLR && out->fdw_seed))
+			/* FDW and imported legacy OLR resume from the position catalog,
+			 * without a Java producer offset. Legacy copies are kept as evidence,
+			 * not interpreted as serialized Debezium files. SQL Server may be
+			 * stopped before recovery has built its connector-specific history. */
+			if (!(type == TYPE_OLR && (out->fdw_seed || strcmp(origin, "LEGACY_COPY") == 0)))
 			{
 				artifact_regular(out->offset, true);
 				if (type != TYPE_POSTGRES)
 					artifact_regular(out->history, !(type == TYPE_SQLSERVER && out->fdw_seed));
 			}
+			if (type == TYPE_ORACLE && strcmp(origin, "LEGACY_COPY") == 0 &&
+				pg_strcasecmp(connection->ispn.ispn_cache_type, "null") != 0)
+				artifact_require_cache_layout(out->cache);
 			artifact_selections(connection, out, identity, false);
 		}
 		else
@@ -698,8 +828,16 @@ synchdb_artifact_request_purge(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32(artifact_retire(&key, true));
 }
 
+static bool
+artifact_same_file(const struct stat *before, const struct stat *after)
+{
+	return before->st_dev == after->st_dev && before->st_ino == after->st_ino &&
+		before->st_size == after->st_size && before->st_mtime == after->st_mtime &&
+		before->st_ctime == after->st_ctime;
+}
+
 static void
-artifact_copy(const char *source, const char *destination)
+artifact_copy_file(const char *source, const char *destination, bool cache_file)
 {
 	int input;
 	int output;
@@ -707,14 +845,22 @@ artifact_copy(const char *source, const char *destination)
 	ssize_t count;
 	uint64 copied = 0;
 	ArtifactCreatedFile *created;
+	struct stat before;
+	struct stat after;
 
-	artifact_regular(source, true);
+	if (!cache_file)
+		artifact_regular(source, true);
 	/* Allocate/register before O_EXCL so an allocation failure cannot strand
 	 * an untracked newly-created file. Link it only after creation succeeds. */
 	created = artifact_track_created(destination);
 	input = OpenTransientFile(source, O_RDONLY | PG_BINARY | O_NOFOLLOW);
 	if (input < 0)
 		ereport(ERROR, (errcode_for_file_access(), errmsg("could not open legacy artifact: %m")));
+	if (fstat(input, &before) < 0)
+		ereport(ERROR, (errcode_for_file_access(), errmsg("could not inspect opened legacy artifact: %m")));
+	if (!S_ISREG(before.st_mode) || before.st_nlink != 1 || before.st_uid != geteuid() ||
+		(before.st_mode & 0022) || before.st_size < 0)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("invalid legacy artifact file \"%s\"", source)));
 	output = OpenTransientFilePerm(destination, O_WRONLY | O_CREAT | O_EXCL | PG_BINARY | O_NOFOLLOW, pg_file_create_mode);
 	if (output < 0)
 		ereport(ERROR, (errcode_for_file_access(), errmsg("could not create migrated artifact: %m")));
@@ -732,7 +878,7 @@ artifact_copy(const char *source, const char *destination)
 			ereport(ERROR, (errcode_for_file_access(), errmsg("could not read legacy artifact: %m")));
 		}
 		copied += count;
-		if (copied > 64 * 1024 * 1024)
+		if (!cache_file && copied > 64 * 1024 * 1024)
 			ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), errmsg("legacy artifact grew beyond 64 MiB during migration")));
 		while (written < count)
 		{
@@ -745,11 +891,281 @@ artifact_copy(const char *source, const char *destination)
 			written += n;
 		}
 	}
+	if (fstat(input, &after) < 0)
+		ereport(ERROR, (errcode_for_file_access(), errmsg("could not recheck legacy artifact: %m")));
+	if (!artifact_same_file(&before, &after) || copied != (uint64) before.st_size)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("legacy artifact changed during migration"),
+						errdetail("Stop the old connector and PostgreSQL cleanly before copying its persisted state.")));
 	if (pg_fsync(output) < 0)
 		ereport(ERROR, (errcode_for_file_access(), errmsg("could not sync migrated artifact: %m")));
 	if (CloseTransientFile(input) < 0 || CloseTransientFile(output) < 0)
 		ereport(ERROR, (errcode_for_file_access(), errmsg("could not close migrated artifact: %m")));
+	if (!cache_file)
+		fsync_fname("pg_synchdb", true);
+}
+
+static void
+artifact_copy(const char *source, const char *destination)
+{
+	artifact_copy_file(source, destination, false);
+}
+
+/* Store files can exceed the offset/history limit and can legitimately be
+ * empty. Copy all metadata as well as data/index, preserving the old tree.
+ * Each exclusive new path is tracked independently: abort removes children
+ * before parents and never recursively visits an existing engine directory. */
+static void
+artifact_cache_stat(const char *path, struct stat *st)
+{
+	if (lstat(path, st) < 0)
+		ereport(ERROR, (errcode_for_file_access(), errmsg("could not inspect Infinispan cache \"%s\": %m", path)));
+	if (!S_ISDIR(st->st_mode) || st->st_uid != geteuid() || (st->st_mode & 0022))
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("Infinispan cache directories must be server-owned directories without writable group/world access")));
+}
+
+static void
+artifact_copy_cache_tree(const char *source, const char *destination, int depth, uint64 *entries)
+{
+	DIR *directory;
+	struct dirent *entry;
+	struct stat before;
+	struct stat after;
+	ArtifactCreatedFile *created;
+
+	CHECK_FOR_INTERRUPTS();
+	check_stack_depth();
+	if (depth > 16 || ++(*entries) > 100000)
+		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), errmsg("legacy Infinispan cache exceeds migration directory limits")));
+	artifact_cache_stat(source, &before);
+	directory = AllocateDir(source);
+	if (!directory)
+		ereport(ERROR, (errcode_for_file_access(), errmsg("could not open legacy Infinispan cache directory: %m")));
+	if (fstat(dirfd(directory), &after) < 0 || !artifact_same_file(&before, &after))
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("legacy Infinispan cache directory changed before copying")));
+	created = artifact_track_created(destination);
+	created->directory = true;
+	if (MakePGDirectory(destination) < 0)
+		ereport(ERROR, (errcode_for_file_access(), errmsg("could not create migrated Infinispan cache directory: %m")));
+	created->next = artifact_created_files;
+	artifact_created_files = created;
+	while ((entry = ReadDir(directory, source)) != NULL)
+	{
+		char *input;
+		char *output;
+		struct stat st;
+
+		if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
+			continue;
+		CHECK_FOR_INTERRUPTS();
+		input = psprintf("%s/%s", source, entry->d_name);
+		output = psprintf("%s/%s", destination, entry->d_name);
+		if (strlen(input) >= MAXPGPATH || strlen(output) >= MAXPGPATH)
+			ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), errmsg("legacy Infinispan cache path exceeds migration limits")));
+		if (lstat(input, &st) < 0)
+			ereport(ERROR, (errcode_for_file_access(), errmsg("could not inspect legacy Infinispan cache entry: %m")));
+		if (S_ISDIR(st.st_mode))
+			artifact_copy_cache_tree(input, output, depth + 1, entries);
+		else if (S_ISREG(st.st_mode))
+		{
+			if (++(*entries) > 100000)
+				ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), errmsg("legacy Infinispan cache exceeds migration entry limits")));
+			artifact_copy_file(input, output, true);
+		}
+		else
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("legacy Infinispan cache contains a symlink or special file")));
+		pfree(input);
+		pfree(output);
+	}
+	artifact_cache_stat(source, &after);
+	if (!artifact_same_file(&before, &after))
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("legacy Infinispan cache directory changed during migration")));
+	FreeDir(directory);
+	fsync_fname(destination, true);
+}
+
+static bool
+artifact_legacy_cache_enabled(const ConnectionInfo *connection, ConnectorType type)
+{
+	if (pg_strcasecmp(connection->ispn.ispn_cache_type, "null") == 0)
+		return false;
+	if (type != TYPE_ORACLE || pg_strcasecmp(connection->ispn.ispn_cache_type, "embedded") != 0 ||
+		(pg_strcasecmp(connection->ispn.ispn_memory_type, "heap") != 0 &&
+		 pg_strcasecmp(connection->ispn.ispn_memory_type, "off heap") != 0) ||
+		connection->ispn.ispn_memory_size == 0 || connection->ispn.ispn_memory_size > PG_INT32_MAX)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("legacy Infinispan migration requires Oracle embedded buffering with valid memory settings")));
+	return true;
+}
+
+static void
+artifact_require_legacy_cache_owner(const ConnectionInfo *connection, Jsonb *claims)
+{
+	Oid types[] = {JSONBOID, OIDOID, TEXTOID};
+	Datum values[3];
+	char *catalog;
+	char *query;
+
+	/* The single-argument filename check already excludes every possible
+	 * alternative database suffix, independent of the capture backend. */
+	if (!claims)
+		return;
+	values[0] = JsonbPGetDatum(claims);
+	values[1] = ObjectIdGetDatum(MyDatabaseId);
+	values[2] = CStringGetTextDatum(psprintf("ispn_%s_%s", connection->name, connection->dstdb));
+	artifact_require_claim_result(
+		"SELECT NOT EXISTS (SELECT 1 FROM jsonb_array_elements($1->'databases') d "
+		"CROSS JOIN LATERAL jsonb_array_elements(d->'connectors') c "
+		"WHERE jsonb_typeof(c->'ispn_cache_type') IS DISTINCT FROM 'string' "
+		"OR c->>'ispn_cache_type'='')",
+		1, types, values,
+		"Infinispan migration requires an explicit cache type for every connector in the cluster ownership inventory");
+	catalog = synchdb_store_relation("synchdb_conninfo", ShareLock);
+	query = psprintf(
+		"WITH declared AS (SELECT c.name,lower(c.ispn_cache_type) AS cache_type "
+		"FROM jsonb_to_recordset($1->'databases') d(oid oid,name text,connectors jsonb) "
+		"CROSS JOIN LATERAL jsonb_to_recordset(d.connectors) c(name text,ispn_cache_type text) WHERE d.oid=$2), "
+		"actual AS (SELECT name::text,lower(coalesce(data->>'ispn_cache_type','null')) AS cache_type FROM %s) "
+		"SELECT NOT EXISTS ((SELECT * FROM declared EXCEPT SELECT * FROM actual) "
+		"UNION ALL (SELECT * FROM actual EXCEPT SELECT * FROM declared))", catalog);
+	artifact_require_claim_result(query, 2, types, values,
+		"legacy ownership inventory no longer matches this database's Infinispan configuration");
+	artifact_require_claim_result(
+		"WITH declared AS (SELECT d.oid,c.name,c.target_database,c.ispn_cache_type "
+		"FROM jsonb_to_recordset($1->'databases') d(oid oid,name text,connectors jsonb) "
+		"CROSS JOIN LATERAL jsonb_to_recordset(d.connectors) "
+		"c(name text,target_database text,ispn_cache_type text)) "
+		"SELECT count(*)=1 AND bool_and(oid=$2) FROM declared "
+		"WHERE lower(ispn_cache_type)<>'null' AND 'ispn_'||name||'_'||target_database=$3",
+		3, types, values,
+		"multiple connector/database pairs claim the same legacy Infinispan cache directory");
+}
+
+static void
+artifact_require_cache_layout(const char *source)
+{
+	const char *groups[] = {"events", "transactions", "processed", "schema"};
+	struct stat st;
+	int index;
+
+	artifact_cache_stat(source, &st);
+	/* A missing transaction store must not be treated as an empty buffer.
+	 * Extra provider metadata, including a persisted rollbacks cache, is copied
+	 * by the complete tree traversal rather than silently discarded. */
+	for (index = 0; index < lengthof(groups); index++)
+	{
+		char *data = psprintf("%s/%s/data", source, groups[index]);
+		char *indexes = psprintf("%s/%s/index", source, groups[index]);
+
+		artifact_cache_stat(data, &st);
+		artifact_cache_stat(indexes, &st);
+		pfree(data);
+		pfree(indexes);
+	}
+}
+
+static void
+artifact_import_legacy_cache(const ConnectionInfo *connection, const SynchdbArtifactPaths *paths)
+{
+	char *source = psprintf("pg_synchdb/ispn_%s_%s", connection->name, connection->dstdb);
+	uint64 entries = 0;
+
+	artifact_require_cache_layout(source);
+	artifact_copy_cache_tree(source, paths->cache, 0, &entries);
 	fsync_fname("pg_synchdb", true);
+}
+
+/* Old OLR wrote native-endian unsigned long long[3], and a separate byte
+ * ('t' or 'f') for snapshot completion. Read the exclusive migration copies,
+ * so the published cursor and the preserved evidence necessarily agree. */
+static void
+artifact_read_legacy_fixed(const char *path, void *buffer, Size size)
+{
+	int descriptor;
+	struct stat st;
+	Size total = 0;
+	char extra;
+	ssize_t count;
+
+	artifact_regular(path, true);
+	descriptor = OpenTransientFile(path, O_RDONLY | PG_BINARY | O_NOFOLLOW);
+	if (descriptor < 0 || fstat(descriptor, &st) < 0)
+		ereport(ERROR, (errcode_for_file_access(), errmsg("could not read legacy OLR artifact: %m")));
+	if (!S_ISREG(st.st_mode) || st.st_nlink != 1 || st.st_uid != geteuid() ||
+		(st.st_mode & 0022) || st.st_size != size)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("legacy OLR artifact has an invalid format"),
+						errdetail("Expected exactly %zu bytes in \"%s\".", size, path)));
+	while (total < size)
+	{
+		count = read(descriptor, (char *) buffer + total, size - total);
+		if (count < 0 && errno == EINTR)
+			continue;
+		if (count < 0)
+			ereport(ERROR, (errcode_for_file_access(), errmsg("could not read legacy OLR artifact: %m")));
+		if (count == 0)
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("legacy OLR artifact was truncated")));
+		total += count;
+	}
+	do
+	{
+		count = read(descriptor, &extra, 1);
+	} while (count < 0 && errno == EINTR);
+	if (count < 0)
+		ereport(ERROR, (errcode_for_file_access(), errmsg("could not read legacy OLR artifact: %m")));
+	if (count != 0)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("legacy OLR artifact changed during migration")));
+	if (CloseTransientFile(descriptor) < 0)
+		ereport(ERROR, (errcode_for_file_access(), errmsg("could not close legacy OLR artifact: %m")));
+}
+
+static void
+artifact_import_legacy_olr(const ConnectionInfo *connection, const SynchdbArtifactPaths *paths)
+{
+	uint64 cursor[3];
+	unsigned char completed;
+	Oid types[] = {OIDOID, UUIDOID, UUIDOID, JSONBOID, INT8OID, INT8OID, INT8OID};
+	Datum values[7];
+	Jsonb *proof;
+	char *catalog;
+	char *query;
+	char *json;
+
+	StaticAssertStmt(sizeof(uint64) == 8, "legacy OLR cursors require 64-bit integers");
+	artifact_read_legacy_fixed(paths->offset, cursor, sizeof(cursor));
+	artifact_read_legacy_fixed(paths->history, &completed, sizeof(completed));
+	if (completed != 't')
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("legacy OLR snapshot has not completed"),
+						errhint("Complete the snapshot and cleanly stop the old connector before migrating its cursor.")));
+	if (!cursor[0] || !cursor[1] || cursor[0] > PG_INT64_MAX ||
+		cursor[1] > PG_INT64_MAX || cursor[2] > PG_INT64_MAX)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("legacy OLR cursor is outside the supported range"),
+						errdetail("SCN and c_scn must be positive, and all coordinates must fit a signed 64-bit integer.")));
+	/* A legacy baseline is usable for compatibility, but has no native
+	 * read-view proof. Never manufacture a snapshot_scn from its last DML:
+	 * concurrent transactions may still contain earlier SCNs after this cursor.
+	 * TODO: provide a source-fenced baseline validation protocol for upgrades. */
+	json = psprintf("{\"protocol\":\"UNVERIFIED_LEGACY_OLR_CDC_V1\","
+		"\"handoff_verified\":false,\"cdc_verified\":false,\"identity_verified\":false,"
+		"\"legacy_scn\":\"" UINT64_FORMAT "\",\"legacy_c_scn\":\"" UINT64_FORMAT
+		"\",\"legacy_c_idx\":\"" UINT64_FORMAT "\"}", cursor[0], cursor[1], cursor[2]);
+	proof = DatumGetJsonbP(DirectFunctionCall1(jsonb_in, CStringGetDatum(json)));
+	values[0] = ObjectIdGetDatum(connection->key.database_oid);
+	values[1] = UUIDPGetDatum(&connection->key.connector_id);
+	values[2] = UUIDPGetDatum(&paths->generation);
+	values[3] = JsonbPGetDatum(proof);
+	values[4] = Int64GetDatum(cursor[0]);
+	values[5] = Int64GetDatum(cursor[1]);
+	values[6] = Int64GetDatum(cursor[2]);
+	catalog = synchdb_store_relation("synchdb_olr_positions", RowExclusiveLock);
+	query = psprintf("INSERT INTO %s (database_oid,connector_id,generation,source_proof,snapshot_scn,scn,c_scn,c_idx) "
+		"VALUES ($1,$2,$3,$4,0,$5,$6,$7)", catalog);
+	if (SPI_execute_with_args(query, 7, types, values, NULL, false, 0) != SPI_OK_INSERT || SPI_processed != 1)
+		elog(ERROR, "could not import legacy OLR cursor");
+	ForceSyncCommit();
 }
 
 Datum
@@ -766,28 +1182,28 @@ synchdb_artifact_migrate_legacy(PG_FUNCTION_ARGS)
 	char *history;
 	Jsonb *identity;
 	pg_uuid_t *result;
+	bool cache_enabled;
+	Jsonb *claims = PG_NARGS() > 1 && !PG_ARGISNULL(1) ? PG_GETARG_JSONB_P(1) : NULL;
 
 	artifact_admin();
 	if (!synchdb_connector_store_get(NameStr(*PG_GETARG_NAME(0)), &connection, &connector, CurrentMemoryContext))
 		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("connector configuration does not exist")));
-	if (strchr(connection.name, '_') || strchr(connection.dstdb, '_'))
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("legacy underscore-separated artifact identity is ambiguous"),
-						errdetail("Migration cannot prove which connector/database pair originally owned this filename. Original files are preserved.")));
 	if (pg_strcasecmp(connector, "mysql") == 0) type = TYPE_MYSQL;
 	else if (pg_strcasecmp(connector, "oracle") == 0) type = TYPE_ORACLE;
 	else if (pg_strcasecmp(connector, "sqlserver") == 0) type = TYPE_SQLSERVER;
 	else if (pg_strcasecmp(connector, "postgres") == 0) type = TYPE_POSTGRES;
+	else if (pg_strcasecmp(connector, "olr") == 0) type = TYPE_OLR;
 	else
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("legacy migration does not support this capture backend")));
 	artifact_directory();
 	catalog = artifact_catalog(&connection.key, true);
 	artifact_require_revision(&connection);
+	artifact_require_legacy_owner(&connection, type, claims);
 	if (synchdb_artifact_store_lookup(&connection.key, &paths))
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("connector already has an active artifact generation")));
-	if (pg_strcasecmp(connection.ispn.ispn_cache_type, "null") != 0)
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("legacy Infinispan caches require dedicated offline migration")));
+	cache_enabled = artifact_legacy_cache_enabled(&connection, type);
+	if (cache_enabled)
+		artifact_require_legacy_cache_owner(&connection, claims);
 	offset = artifact_legacy_path(&connection, type, "offsets");
 	history = artifact_legacy_path(&connection, type, "schemahistory");
 	artifact_new_generation(&generation);
@@ -799,8 +1215,14 @@ synchdb_artifact_migrate_legacy(PG_FUNCTION_ARGS)
 	artifact_copy(offset, paths.offset);
 	if (artifact_regular(history, type != TYPE_POSTGRES))
 		artifact_copy(history, paths.history);
+	if (cache_enabled)
+		artifact_import_legacy_cache(&connection, &paths);
 	artifact_selections(&connection, &paths, identity, true);
 	artifact_insert(catalog, &connection, &paths, identity, "LEGACY_COPY");
+	if (cache_enabled)
+		ForceSyncCommit(); /* Publish the recovery set durably before CDC opens it. */
+	if (type == TYPE_OLR)
+		artifact_import_legacy_olr(&connection, &paths);
 	MemoryContextSwitchTo(caller);
 	result = palloc(sizeof(*result));
 	*result = generation;

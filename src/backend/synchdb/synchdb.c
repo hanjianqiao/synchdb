@@ -1420,18 +1420,21 @@ start_debezium_engine(ConnectorType connectorType, const ConnectionInfo *connInf
 /* A committed engine generation is the authority for stop/start continuation.
  * File presence alone must never turn an interrupted FDW bootstrap into CDC. */
 static bool
-fdw_has_artifacts(const ConnectionInfo *connection)
+fdw_has_artifacts(const ConnectionInfo *connection, bool *fdw_seed)
 {
 	SynchdbArtifactPaths paths;
 	bool found = false;
 	bool previous = synchdb_worker_sql_interruptible();
 
+	*fdw_seed = false;
 	PG_TRY();
 	{
 		synchdb_worker_sql_enter();
 		StartTransactionCommand();
 		PushActiveSnapshot(GetTransactionSnapshot());
 		found = synchdb_artifact_store_lookup(&connection->key, &paths);
+		if (found)
+			*fdw_seed = paths.fdw_seed;
 		PopActiveSnapshot();
 		CommitTransactionCommand();
 	}
@@ -1444,7 +1447,7 @@ fdw_has_artifacts(const ConnectionInfo *connection)
 }
 
 static void
-start_fdw_capture(ConnectorType type, ConnectionInfo *connection)
+start_fdw_capture(ConnectorType type, ConnectionInfo *connection, bool fdw_seed)
 {
 	/* TODO: coordinate the FDW source read view, schema history and CDC offset.
 	 * This restores the legacy continuation without claiming that boundary is
@@ -1463,8 +1466,11 @@ start_fdw_capture(ConnectorType type, ConnectionInfo *connection)
 		return;
 	}
 #endif
+	/* v1.4 SQL Server fell back to Debezium even when FDW was configured.
+	 * Its imported generation already has complete engine-owned history;
+	 * only a real FDW seed needs recovery to build that history. */
 	start_debezium_engine(type, connection,
-		type == TYPE_SQLSERVER ? "recovery" : "initial");
+		type == TYPE_SQLSERVER && fdw_seed ? "recovery" : "initial");
 }
 
 /* Select this run's work without turning a snapshot-only request into CDC. */
@@ -1498,6 +1504,7 @@ start_snapshot_run(ConnectorType type, ConnectionInfo *connInfo, const char *sna
 	if (!(connInfo->flag & CONNFLAG_NO_CDC_MODE))
 	{
 		bool resume = false;
+		bool fdw_seed = false;
 
 		if (!worker.java.creation_attempted)
 			initialize_jvm(&connInfo->jmx, &connInfo->run_options);
@@ -1506,7 +1513,7 @@ start_snapshot_run(ConnectorType type, ConnectionInfo *connInfo, const char *sna
 			resume = olr_handoff_prepare(connInfo, &worker.java);
 		else
 #endif
-			resume = fdw_has_artifacts(connInfo);
+			resume = fdw_has_artifacts(connInfo, &fdw_seed);
 		if (resume)
 		{
 			/* A failed bootstrap can leave the generation claimed, while its
@@ -1522,7 +1529,7 @@ start_snapshot_run(ConnectorType type, ConnectionInfo *connInfo, const char *sna
 				ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("FDW always mode requires a fresh target and artifact generation")));
-			start_fdw_capture(type, connInfo);
+			start_fdw_capture(type, connInfo, fdw_seed);
 			synchdb_registry_report_bootstrap(sdb_state, &worker.owner,
 				(int) SYNCHDB_BOOTSTRAP_COMPLETE + 1);
 			return true;
@@ -2427,7 +2434,7 @@ launch_fdw_based_snapshot(ConnectorType connectorType, ConnectionInfo *connInfo,
 		set_shm_connector_stage(myConnectorId, STAGE_CHANGE_DATA_CAPTURE);
 		set_shm_connector_errmsg(myConnectorId, NULL);
 		if (result->continue_cdc)
-			start_fdw_capture(connectorType, connInfo);
+			start_fdw_capture(connectorType, connInfo, true);
 		else
 			set_shm_connector_state(myConnectorId, STATE_PAUSED);
 	}
